@@ -36,7 +36,7 @@ use serde::Serialize;
 
 use super::{
     build::{self, load_index, save_index, single_or_multi_insert, BuildStats},
-    product, scalar, search, spherical,
+    product, scalar, search, spherical, turboquant,
 };
 use crate::{
     backend::index::{
@@ -80,7 +80,7 @@ macro_rules! register_streaming {
     };
 }
 
-#[cfg(any(feature = "product-quantization", feature = "scalar-quantization"))]
+#[cfg(any(feature = "product-quantization", feature = "scalar-quantization", feature = "turboquant-quantization"))]
 pub(super) use register;
 
 pub(super) fn register_benchmarks(benchmarks: &mut diskann_benchmark_runner::registry::Benchmarks) {
@@ -131,6 +131,7 @@ pub(super) fn register_benchmarks(benchmarks: &mut diskann_benchmark_runner::reg
     product::register_benchmarks(benchmarks);
     scalar::register_benchmarks(benchmarks);
     spherical::register_benchmarks(benchmarks);
+    turboquant::register_benchmarks(benchmarks);
 }
 
 //////////////

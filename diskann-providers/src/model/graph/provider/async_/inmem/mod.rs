@@ -13,6 +13,9 @@ pub use provider::{DefaultProvider, DefaultProviderParameters, SetStartPoints};
 mod scalar;
 pub use scalar::{SQError, SQStore, WithBits};
 
+pub mod turboquant;
+pub use turboquant::{TQError, TQStore, WithTurboQuant};
+
 #[cfg(not(test))]
 mod product;
 pub use product::DefaultQuant;

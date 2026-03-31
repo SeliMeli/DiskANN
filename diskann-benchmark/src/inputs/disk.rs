@@ -350,6 +350,17 @@ impl DiskIndexBuild {
                     write_field!(f, "Quantization", format!("sq, nbits {nbits}"))?
                 }
             }
+            QuantizationType::TQ {
+                nbits,
+                seed,
+                use_hadamard,
+            } => {
+                write_field!(
+                    f,
+                    "Quantization",
+                    format!("tq, nbits {nbits}, seed {seed}, hadamard {use_hadamard}")
+                )?
+            }
         }
         write_field!(f, "Save Path", self.save_path)?;
         Ok(())

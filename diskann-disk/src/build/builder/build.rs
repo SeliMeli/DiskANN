@@ -55,7 +55,10 @@ use crate::{
         },
     },
     storage::{
-        quant::{GeneratorContext, PQGeneration, PQGenerationContext, QuantDataGenerator},
+        quant::{
+            GeneratorContext, PQGeneration, PQGenerationContext, QuantDataGenerator,
+            TQGeneration, TQGenerationContext,
+        },
         DiskIndexWriter,
     },
     utils::instrumentation::{
@@ -249,15 +252,7 @@ where
     }
 
     async fn generate_compressed_data(&mut self, pool: &RayonThreadPool) -> ANNResult<()> {
-        let num_points = self.index_configuration.max_points;
-        let num_chunks = self.disk_build_param.search_pq_chunks();
-
         let storage_provider = self.core.storage_provider;
-
-        info!(
-            "Compressing data into {} bytes per vector for disk search",
-            num_chunks.get()
-        );
 
         let mut checkpoint_context = OwnedCheckpointContext::new(
             self.checkpoint_record_manager.clone_box(),
@@ -273,31 +268,54 @@ where
             }
         };
 
-        let quantizer_context = PQGenerationContext {
-            pq_storage: self.pq_storage.clone(),
-            num_chunks: num_chunks.get(),
-            max_kmeans_reps: NUM_KMEANS_REPS_PQ,
-            num_centers: NUM_PQ_CENTROIDS,
-            seed: self.index_configuration.random_seed,
-            p_val: MAX_PQ_TRAINING_SET_SIZE / (num_points as f64),
-            storage_provider,
-            pool,
-            dim: self.index_configuration.dim,
-            metric: self.index_configuration.dist_metric,
-        };
-
         let generator_context =
             GeneratorContext::new(offset, self.pq_storage.get_compressed_data_path().into());
 
-        let generator = QuantDataGenerator::<
-            Data::VectorDataType,
-            PQGeneration<Data::VectorDataType, StorageProvider, &RayonThreadPool>,
-        >::new(
-            self.index_writer.get_dataset_file(),
-            generator_context,
-            &quantizer_context,
-        )?;
-        let progress = generator.generate_data(storage_provider, &pool, &self.chunking_config)?;
+        let progress = if let BuildQuantizer::TurboQuant(ref tq) = self.build_quantizer {
+            // Use TQ compression for search data
+            let tq_context = TQGenerationContext {
+                quantizer: tq.quantizer().clone(),
+            };
+            info!(
+                "Compressing data with TurboQuant ({}bit) for disk search",
+                tq.quantizer().nbits()
+            );
+            let generator = QuantDataGenerator::<Data::VectorDataType, TQGeneration>::new(
+                self.index_writer.get_dataset_file(),
+                generator_context,
+                &tq_context,
+            )?;
+            generator.generate_data(storage_provider, &pool, &self.chunking_config)?
+        } else {
+            // Default: PQ compression for search data
+            let num_points = self.index_configuration.max_points;
+            let num_chunks = self.disk_build_param.search_pq_chunks();
+            info!(
+                "Compressing data into {} bytes per vector for disk search",
+                num_chunks.get()
+            );
+            let quantizer_context = PQGenerationContext {
+                pq_storage: self.pq_storage.clone(),
+                num_chunks: num_chunks.get(),
+                max_kmeans_reps: NUM_KMEANS_REPS_PQ,
+                num_centers: NUM_PQ_CENTROIDS,
+                seed: self.index_configuration.random_seed,
+                p_val: MAX_PQ_TRAINING_SET_SIZE / (num_points as f64),
+                storage_provider,
+                pool,
+                dim: self.index_configuration.dim,
+                metric: self.index_configuration.dist_metric,
+            };
+            let generator = QuantDataGenerator::<
+                Data::VectorDataType,
+                PQGeneration<Data::VectorDataType, StorageProvider, &RayonThreadPool>,
+            >::new(
+                self.index_writer.get_dataset_file(),
+                generator_context,
+                &quantizer_context,
+            )?;
+            generator.generate_data(storage_provider, &pool, &self.chunking_config)?
+        };
 
         checkpoint_context.update(progress.clone())?;
         if let Progress::Processed(progress_point) = progress {

@@ -24,6 +24,7 @@ members = [
     "diskann-benchmark",
     "diskann-tools",
     "vectorset",
+    "turboquant-bench",
 ]
 
 default-members = [

@@ -22,7 +22,7 @@ use diskann_providers::{
             common::{FullPrecision, NoDeletes, NoStore, Quantized, SetElementHelper, VectorStore},
             inmem::{
                 DefaultProvider, DefaultProviderParameters, DefaultQuant, FullPrecisionProvider,
-                SQStore, SetStartPoints,
+                SQStore, SetStartPoints, TQStore,
             },
         },
         IndexConfiguration,
@@ -321,6 +321,11 @@ where
                 diskann_async::new_quant_only_index(config, params, table.clone(), NoDeletes)?;
             Ok(Arc::new(QuantInMemBuilder::<T, _>::new(index)))
         }
+        BuildQuantizer::TurboQuant(tq) => {
+            let index =
+                diskann_async::new_quant_only_index(config, params, tq.clone(), NoDeletes)?;
+            Ok(Arc::new(QuantInMemBuilder::<T, _>::new(index)))
+        }
     }
 }
 
@@ -371,6 +376,12 @@ where
         BuildQuantizer::PQ(_) => {
             let index =
                 load_index::<_, NoStore, DefaultQuant>(storage_provider, index_path_prefix, config)
+                    .await?;
+            Ok(Arc::new(QuantInMemBuilder::<T, _>::new(index)))
+        }
+        BuildQuantizer::TurboQuant(_) => {
+            let index =
+                load_index::<_, NoStore, TQStore>(storage_provider, index_path_prefix, config)
                     .await?;
             Ok(Arc::new(QuantInMemBuilder::<T, _>::new(index)))
         }

@@ -57,14 +57,14 @@ impl std::fmt::Display for BuildResult {
 // QuantBuildResult //
 //////////////////////
 
-#[cfg(any(feature = "product-quantization", feature = "scalar-quantization",))]
+#[cfg(any(feature = "product-quantization", feature = "scalar-quantization", feature = "turboquant-quantization"))]
 #[derive(Debug, Serialize)]
 pub(super) struct QuantBuildResult {
     pub(super) quant_training_time: MicroSeconds,
     pub(super) build: BuildResult,
 }
 
-#[cfg(any(feature = "product-quantization", feature = "scalar-quantization",))]
+#[cfg(any(feature = "product-quantization", feature = "scalar-quantization", feature = "turboquant-quantization"))]
 impl std::fmt::Display for QuantBuildResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(

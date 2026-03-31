@@ -13,7 +13,7 @@ use serde::{
 use thiserror::Error;
 
 const EXPECTED_QUANTIZATION_TEMPLATE: &str =
-    "Expected 'FP', 'PQ_N', 'SQ_NBITS'(STDDEV=2.0 by default), 'SQ_NBITS_STDDEV', got: ";
+    "Expected 'FP', 'PQ_N', 'SQ_NBITS'(STDDEV=2.0 by default), 'SQ_NBITS_STDDEV', 'TQ_NBITS'(SEED=42 by default), 'TQ_NBITS_SEED', got: ";
 
 /// - `PQ`: Product Quantization with a specified number of chunks.
 /// - `SQ`: Scalar Quantization with a specified number of bits per dimension and a standard deviation.
@@ -37,6 +37,16 @@ pub enum QuantizationType {
         /// encoding's dynamic range. This number **must** be positive, and generally should
         /// be greater than 1.0.
         standard_deviation: Option<Positive<f64>>,
+    },
+
+    /// TurboQuant: data-oblivious quantization via random rotation + Lloyd-Max centroids.
+    TQ {
+        /// Bits per coordinate (1-4 supported).
+        nbits: usize,
+        /// RNG seed for reproducible rotation matrix. Defaults to 42.
+        seed: u64,
+        /// Use fast Hadamard rotation (O(d log d)) instead of dense (O(d²)).
+        use_hadamard: bool,
     },
 }
 
@@ -146,6 +156,34 @@ impl FromStr for QuantizationType {
                     standard_deviation,
                 })
             }
+            "tq" => {
+                if parts.len() < 2 || parts.len() > 3 {
+                    return Err(QuantizationTypeParseError(format!(
+                        "{} {}",
+                        EXPECTED_QUANTIZATION_TEMPLATE, s
+                    )));
+                }
+
+                let nbits = parts[1].parse::<usize>().map_err(|_| {
+                    QuantizationTypeParseError(format!("{} {}", EXPECTED_QUANTIZATION_TEMPLATE, s))
+                })?;
+                let seed = if parts.len() == 3 {
+                    parts[2].parse::<u64>().map_err(|_| {
+                        QuantizationTypeParseError(format!(
+                            "{} {}",
+                            EXPECTED_QUANTIZATION_TEMPLATE, s
+                        ))
+                    })?
+                } else {
+                    42
+                };
+
+                Ok(QuantizationType::TQ {
+                    nbits,
+                    seed,
+                    use_hadamard: true,
+                })
+            }
             _ => Err(QuantizationTypeParseError(format!(
                 "{} {}",
                 EXPECTED_QUANTIZATION_TEMPLATE, s
@@ -168,6 +206,9 @@ impl Display for QuantizationType {
                     None => "None".to_string(),
                 };
                 write!(f, "SQ_{}_{}", nbits, standard_deviation)
+            }
+            QuantizationType::TQ { nbits, seed, .. } => {
+                write!(f, "TQ_{}_{}", nbits, seed)
             }
         }
     }

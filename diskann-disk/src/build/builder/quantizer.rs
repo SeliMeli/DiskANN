@@ -9,7 +9,7 @@ use diskann_providers::{
     index::diskann_async::train_pq,
     model::{
         graph::{
-            provider::async_::{common::NoStore, inmem::WithBits},
+            provider::async_::{common::NoStore, inmem::{WithBits, WithTurboQuant}},
             traits::GraphDataType,
         },
         FixedChunkPQTable, IndexConfiguration, MAX_PQ_TRAINING_SET_SIZE,
@@ -18,7 +18,9 @@ use diskann_providers::{
     utils::{BridgeErr, PQPathNames},
 };
 use diskann_quantization::scalar::train::ScalarQuantizationParameters;
+use diskann_quantization::turboquant::TurboQuantQuantizer;
 use diskann_utils::views::MatrixView;
+use rand::{SeedableRng, rngs::StdRng};
 use tracing::info;
 
 use crate::QuantizationType;
@@ -29,6 +31,7 @@ pub enum BuildQuantizer {
     NoQuant(NoStore),
     Scalar1Bit(WithBits<1>),
     PQ(FixedChunkPQTable),
+    TurboQuant(WithTurboQuant),
 }
 
 impl BuildQuantizer {
@@ -119,6 +122,24 @@ impl BuildQuantizer {
 
                 Ok(Self::Scalar1Bit(WithBits::<1>::new(quantizer)))
             }
+            QuantizationType::TQ {
+                nbits,
+                seed,
+                use_hadamard,
+            } => {
+                let dim = index_configuration.dim;
+                let mut rng = StdRng::seed_from_u64(seed);
+                let quantizer = if use_hadamard {
+                    TurboQuantQuantizer::new_hadamard(dim, nbits, &mut rng)
+                } else {
+                    TurboQuantQuantizer::new(dim, nbits, &mut rng)
+                };
+                info!(
+                    "TurboQuant quantizer created: {}bit, dim={}, hadamard={}, seed={}",
+                    nbits, dim, use_hadamard, seed
+                );
+                Ok(Self::TurboQuant(WithTurboQuant::new(quantizer)))
+            }
         }
     }
 
@@ -151,6 +172,22 @@ impl BuildQuantizer {
                 let sq_storage = SQStorage::new(index_path_prefix);
                 let sq_quantizer = sq_storage.load_quantizer(storage_provider)?;
                 Ok(Self::Scalar1Bit(WithBits::<1>::new(sq_quantizer)))
+            }
+            QuantizationType::TQ {
+                nbits,
+                seed,
+                use_hadamard,
+            } => {
+                // TQ is data-oblivious: recreate from seed (no training data needed).
+                let dim = 0; // Will be set when index metadata is loaded
+                // For load, we need the dim from config. But dim isn't available here.
+                // The disk index build path recreates the quantizer during build, not load.
+                // For now, error on load since TQ disk index load is not yet supported.
+                let _ = (nbits, seed, use_hadamard, dim);
+                Err(ANNError::log_index_config_error(
+                    "build_quantization_type".to_string(),
+                    "TurboQuant load is not yet supported for disk index".to_string(),
+                ))
             }
         }
     }

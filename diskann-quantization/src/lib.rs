@@ -184,6 +184,7 @@ pub mod multi_vector;
 pub mod product;
 pub mod scalar;
 pub mod spherical;
+pub mod turboquant;
 
 /// Selector for the parallelization strategy used by some algorithms.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]

@@ -57,6 +57,10 @@ fn estimate_build_index_ram_usage(
         QuantizationType::SQ { nbits, .. } => {
             (nbits as u64 * dim).div_ceil(8) + std::mem::size_of::<f32>() as u64
         }
+        // TQ stores packed codes + norm(f32) + quant_norm_sq(f32).
+        QuantizationType::TQ { nbits, .. } => {
+            (nbits as u64 * dim).div_ceil(8) + 2 * std::mem::size_of::<f32>() as u64
+        }
     };
 
     OVERHEAD_FACTOR * (graph_size + (single_vec_size * num_points) as f64)

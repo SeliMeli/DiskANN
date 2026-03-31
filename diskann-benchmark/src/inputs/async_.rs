@@ -46,6 +46,7 @@ pub(super) fn register_inputs(
     registry.register(Input::<IndexPQOperation>::new())?;
     registry.register(Input::<IndexSQOperation>::new())?;
     registry.register(Input::<SphericalQuantBuild>::new())?;
+    registry.register(Input::<IndexTQOperation>::new())?;
     registry.register(Input::<DynamicIndexRun>::new())?;
     Ok(())
 }
@@ -864,6 +865,95 @@ impl std::fmt::Display for IndexSQOperation {
         writeln!(f)?;
         self.index_operation.source.summarize_fields(f)?;
 
+        Ok(())
+    }
+}
+
+////////////////////////////
+// Async Build TurboQuant //
+////////////////////////////
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct IndexTQOperation {
+    pub(crate) index_operation: IndexOperation,
+    pub(crate) nbits: usize,
+    pub(crate) seed: u64,
+    pub(crate) use_fp_for_search: bool,
+    #[serde(default)]
+    pub(crate) use_hadamard: bool,
+    /// When true, build graph with FP distances (best quality), search with TQ.
+    /// When false (default), build and search both use TQ distances.
+    #[serde(default)]
+    pub(crate) use_fp_for_build: bool,
+}
+
+as_input!(IndexTQOperation);
+
+impl IndexTQOperation {
+    pub(crate) const fn tag() -> &'static str {
+        "async-index-build-tq"
+    }
+
+    #[cfg(feature = "turboquant-quantization")]
+    pub(crate) fn try_as_config(&self) -> anyhow::Result<config::Builder> {
+        match &self.index_operation.source {
+            IndexSource::Load(_) => Err(anyhow::anyhow!(
+                "TurboQuant load not yet supported"
+            )),
+            IndexSource::Build(build) => build.try_as_config(),
+        }
+    }
+
+    #[cfg(feature = "turboquant-quantization")]
+    pub(crate) fn inmem_parameters(
+        &self,
+        num_points: usize,
+        dim: usize,
+    ) -> Result<DefaultProviderParameters, anyhow::Error> {
+        match &self.index_operation.source {
+            IndexSource::Load(_) => Err(anyhow::anyhow!(
+                "inmem_parameters is only supported for builds, not loads"
+            )),
+            IndexSource::Build(b) => Ok(b.inmem_parameters(num_points, dim)),
+        }
+    }
+}
+
+impl CheckDeserialization for IndexTQOperation {
+    fn check_deserialization(&mut self, checker: &mut Checker) -> anyhow::Result<()> {
+        self.index_operation.check_deserialization(checker)
+    }
+}
+
+impl Example for IndexTQOperation {
+    fn example() -> Self {
+        let mut index_operation = IndexOperation::example();
+        match &mut index_operation.source {
+            IndexSource::Load(_) => {}
+            IndexSource::Build(b) => b.multi_insert = None,
+        }
+
+        Self {
+            index_operation,
+            nbits: 4,
+            seed: 42,
+            use_fp_for_search: false,
+            use_hadamard: false,
+            use_fp_for_build: false,
+        }
+    }
+}
+
+impl std::fmt::Display for IndexTQOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Async TurboQuant Index Build")?;
+        write_field!(f, "tag", Self::tag())?;
+        write_field!(f, "TQ bits", self.nbits)?;
+        write_field!(f, "Seed", self.seed)?;
+        write_field!(f, "Use FP Search", self.use_fp_for_search)?;
+        write_field!(f, "Use FP Build", self.use_fp_for_build)?;
+        writeln!(f)?;
+        self.index_operation.source.summarize_fields(f)?;
         Ok(())
     }
 }

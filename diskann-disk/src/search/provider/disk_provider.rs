@@ -41,6 +41,7 @@ use diskann_providers::{
     },
     storage::{get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file, LoadWith},
 };
+use diskann_quantization::turboquant::TurboQuantQuantizer;
 use diskann_vector::{distance::Metric, DistanceFunction, PreprocessedDistanceFunction};
 use futures_util::future;
 use tokio::runtime::Runtime;
@@ -67,6 +68,20 @@ use crate::{
 /// The disk format stores both the vectors and the adjacency list next to each other for
 /// better locality for quicker access.
 /// Please refer to the RFC documentation at [`docs\rfcs\cy2025\disk_provider_for_async_index.md`] for design details.
+/// Which quantizer is used for disk search distance computation.
+pub enum DiskQuantizerMode {
+    /// Standard PQ distance tables.
+    PQ,
+    /// TurboQuant: rotate query, then centroid-lookup distances.
+    TQ {
+        quantizer: TurboQuantQuantizer,
+        /// All compressed vectors (flat buffer, compressed_bytes_per_vec * num_points).
+        compressed_data: Vec<u8>,
+        /// Bytes per compressed vector.
+        bytes_per_vec: usize,
+    },
+}
+
 pub struct DiskProvider<Data>
 where
     Data: GraphDataType<VectorIdType = u32>,
@@ -88,6 +103,9 @@ where
 
     /// The number of IO operations that can be done in parallel.
     search_io_limit: usize,
+
+    /// Which quantizer mode to use for distance computation.
+    quantizer_mode: DiskQuantizerMode,
 }
 
 impl<Data> DataProvider for DiskProvider<Data>
@@ -197,6 +215,7 @@ where
             num_points,
             metric,
             search_io_limit,
+            quantizer_mode: DiskQuantizerMode::PQ,
         })
     }
 }

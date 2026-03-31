@@ -60,6 +60,9 @@ product-quantization = []
 # Enable scalar-quantization based algorithms
 scalar-quantization = []
 
+# Enable turboquant-quantization based algorithms
+turboquant-quantization = []
+
 # Enable minmax-quantization based algorithms
 minmax-quantization = []
 

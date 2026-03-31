@@ -110,7 +110,7 @@ where
     }
 }
 
-#[cfg(any(feature = "scalar-quantization", feature = "spherical-quantization"))]
+#[cfg(any(feature = "scalar-quantization", feature = "spherical-quantization", feature = "turboquant-quantization"))]
 pub(super) fn only_single_insert<DP, T, S>(
     index: Arc<DiskANNIndex<DP>>,
     strategy: S,
