@@ -1009,10 +1009,14 @@ where
     let medoid = find_medoid_from_source(full_data);
     tracing::info!(sketch_secs = sketch_secs, medoid = medoid, "Phase 0 complete");
 
-    // ── Phase 1: Global partition → leaf build → HashPrune ──
-    // Same logic as one-shot build, but data comes from mmap (full_data).
-    // partition_assign already processes in GEMM stripes (~16 MB each),
-    // leaf build touches c_max vectors per leaf. Peak data RSS is bounded.
+    // ── Phase 1: Global partition (chunked GEMM) → leaf build (mmap) → HashPrune ──
+    //
+    // Partition: top-level point→leader GEMM is computed shard-by-shard via
+    // shard_factory (only one shard's data in memory at a time). Recursive
+    // sub-partitions use full_data (mmap) since sub-clusters are small.
+    //
+    // Leaf build: each leaf has ≤c_max vectors accessed via full_data (mmap).
+    // OS pages in only ~200 KB per leaf, not the full dataset.
     let hash_prune = HashPrune::from_sketches(sketches, npoints, config.l_max, config.max_degree);
     let mut partition_secs = 0.0f64;
     let mut leaf_build_secs = 0.0f64;
@@ -1028,13 +1032,20 @@ where
             fanout: config.fanout.clone(),
             metric: config.metric,
         };
-        let indices: Vec<usize> = (0..npoints).collect();
 
         let t1 = Instant::now();
-        let leaves = partition::parallel_partition(full_data, &indices, &partition_config, seed);
+        let leaves = partition::parallel_partition_sharded(
+            shard_ranges,
+            shard_factory,
+            full_data,
+            npoints,
+            &partition_config,
+            seed,
+        );
         partition_secs += t1.elapsed().as_secs_f64();
         total_leaves += leaves.len();
 
+        // Leaf build: access vectors via full_data (mmap random access).
         let t2 = Instant::now();
         use std::sync::atomic::{AtomicUsize, Ordering};
         let replica_edges = AtomicUsize::new(0);

@@ -641,6 +641,258 @@ pub fn parallel_partition<D: VectorDataSource>(
     results.into_iter().flatten().collect()
 }
 
+/// Sharded parallel partition: global RBC with chunked distance computation.
+///
+/// Same result as `parallel_partition`, but the top-level point-to-leader
+/// GEMM is computed chunk-by-chunk via `shard_factory` to bound peak data
+/// memory. Only leader vectors (~1000 × ndims × 4 bytes) and assignment
+/// metadata (npoints × fanout × 4 bytes) are fully resident.
+///
+/// Recursive sub-partitions use `full_data` (typically mmap) since
+/// sub-clusters are small enough that random page access is fine.
+#[allow(clippy::disallowed_methods)]
+pub fn parallel_partition_sharded<S, D>(
+    shard_ranges: &[(usize, usize)],
+    shard_factory: &(impl Fn(usize) -> S + Sync),
+    full_data: &D,
+    npoints: usize,
+    config: &PartitionConfig,
+    seed: u64,
+) -> Vec<Leaf>
+where
+    S: VectorDataSource,
+    D: VectorDataSource + Sync,
+{
+    if npoints <= config.c_max {
+        return vec![Leaf {
+            indices: (0..npoints).collect(),
+        }];
+    }
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let fanout = if !config.fanout.is_empty() {
+        config.fanout[0]
+    } else {
+        3
+    };
+
+    let num_leaders = sample_num_leaders(npoints, config.p_samp);
+    let all_indices: Vec<usize> = (0..npoints).collect();
+    let leaders: Vec<usize> = all_indices
+        .choose_multiple(&mut rng, num_leaders)
+        .copied()
+        .collect();
+
+    // Top-level assignment: chunked GEMM across shards.
+    let t0 = std::time::Instant::now();
+    let clusters_local = partition_assign_chunked(
+        shard_ranges,
+        shard_factory,
+        full_data,
+        npoints,
+        &leaders,
+        fanout,
+        config.metric,
+    );
+    let assign_time = t0.elapsed();
+
+    // Map local indices to global (identity for top-level: local == global).
+    let clusters: Vec<Vec<usize>> = clusters_local
+        .into_iter()
+        .map(|local_cluster| local_cluster.into_iter().map(|li| li).collect())
+        .collect();
+
+    tracing::debug!(
+        assign_secs = assign_time.as_secs_f64(),
+        num_leaders = num_leaders,
+        fanout = fanout,
+        "top-level sharded partition assign"
+    );
+
+    // Merge undersized clusters using full_data (mmap random access for centroids).
+    let merged_clusters = merge_small_into_nearest(full_data, clusters, config.c_min);
+
+    let need_recurse = merged_clusters
+        .iter()
+        .filter(|c| c.len() > config.c_max)
+        .count();
+    tracing::debug!(
+        num_clusters = merged_clusters.len(),
+        need_recurse = need_recurse,
+        "partition merge (sharded)"
+    );
+
+    // Recurse on oversized clusters using full_data (sub-clusters are small).
+    let sub_seeds: Vec<u64> = (0..merged_clusters.len()).map(|_| rng.random()).collect();
+
+    let t2 = std::time::Instant::now();
+    let results: Vec<Vec<Leaf>> = merged_clusters
+        .par_iter()
+        .zip(sub_seeds.par_iter())
+        .map(|(cluster, sub_seed)| {
+            if cluster.len() <= config.c_max {
+                vec![Leaf {
+                    indices: cluster.clone(),
+                }]
+            } else {
+                let mut sub_rng = rand::rngs::StdRng::seed_from_u64(*sub_seed);
+                partition(full_data, cluster, config, 1, &mut sub_rng)
+            }
+        })
+        .collect();
+
+    tracing::debug!(
+        recursion_secs = t2.elapsed().as_secs_f64(),
+        "partition recursion complete (sharded)"
+    );
+    results.into_iter().flatten().collect()
+}
+
+/// Chunked partition assignment: same as `partition_assign` but loads data
+/// shard-by-shard for the GEMM, bounding peak data memory.
+///
+/// Leader vectors are extracted from `full_data` (mmap, ~1000 × ndims × 4 = small).
+/// Point data is loaded per-shard from `shard_factory`.
+#[allow(clippy::disallowed_methods)]
+fn partition_assign_chunked<S, D>(
+    shard_ranges: &[(usize, usize)],
+    shard_factory: &(impl Fn(usize) -> S + Sync),
+    full_data: &D,
+    npoints: usize,
+    leaders: &[usize],
+    fanout: usize,
+    metric: diskann_vector::distance::Metric,
+) -> Vec<Vec<usize>>
+where
+    S: VectorDataSource,
+    D: VectorDataSource,
+{
+    let nl = leaders.len();
+    let ndims = full_data.ndims();
+    let num_assign = fanout.min(nl);
+
+    use diskann_vector::distance::Metric;
+
+    // Extract leader data from mmap (small: nl × ndims × 4 bytes).
+    let mut l_data = vec![0.0f32; nl * ndims];
+    for (i, &idx) in leaders.iter().enumerate() {
+        let src = full_data.get(idx);
+        let dst = &mut l_data[i * ndims..(i + 1) * ndims];
+        D::Elem::as_f32_into(src, dst).expect("f32 conversion");
+    }
+
+    // Precompute leader norms.
+    let l_norms: Vec<f32> = match metric {
+        Metric::L2 => {
+            let mut norms = vec![0.0f32; nl];
+            for i in 0..nl {
+                let row = &l_data[i * ndims..(i + 1) * ndims];
+                norms[i] = row.iter().map(|v| v * v).sum();
+            }
+            norms
+        }
+        Metric::Cosine => {
+            let mut norms = vec![0.0f32; nl];
+            for i in 0..nl {
+                let row = &l_data[i * ndims..(i + 1) * ndims];
+                norms[i] = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            }
+            norms
+        }
+        Metric::CosineNormalized | Metric::InnerProduct => Vec::new(),
+    };
+
+    // Flat assignments for all npoints.
+    let mut assignments = vec![0u32; npoints * num_assign];
+
+    let stripe: usize =
+        ((16 * 1024 * 1024) / (nl.max(1) * std::mem::size_of::<f32>())).clamp(256, 16_384);
+
+    // Process each shard: load data, compute GEMM to leaders, store assignments, drop data.
+    for (shard_id, &(offset, shard_n)) in shard_ranges.iter().enumerate() {
+        let shard = shard_factory(shard_id);
+
+        // Process this shard in stripes (same as partition_assign).
+        let shard_assignments = &mut assignments[offset * num_assign..(offset + shard_n) * num_assign];
+        shard_assignments
+            .par_chunks_mut(stripe * num_assign)
+            .enumerate()
+            .for_each(|(stripe_idx, assign_chunk)| {
+                let start = stripe_idx * stripe;
+                let end = (start + stripe).min(shard_n);
+                let sn = end - start;
+
+                let mut p_data = vec![0.0f32; sn * ndims];
+                for i in 0..sn {
+                    let src = shard.get(start + i);
+                    let dst = &mut p_data[i * ndims..(i + 1) * ndims];
+                    S::Elem::as_f32_into(src, dst).expect("f32 conversion");
+                }
+
+                let mut dots = vec![0.0f32; sn * nl];
+                crate::gemm::sgemm_abt(&p_data, sn, ndims, &l_data, nl, &mut dots);
+
+                let mut buf: Vec<(u32, f32)> = Vec::with_capacity(nl);
+                for i in 0..sn {
+                    let dot_row = &dots[i * nl..(i + 1) * nl];
+                    buf.clear();
+                    match metric {
+                        Metric::CosineNormalized => {
+                            for (j, &dot_val) in dot_row.iter().enumerate() {
+                                buf.push((j as u32, (1.0 - dot_val).max(0.0)));
+                            }
+                        }
+                        Metric::Cosine => {
+                            let mut pi = 0.0f32;
+                            let row = &p_data[i * ndims..(i + 1) * ndims];
+                            for &v in row { pi += v * v; }
+                            let pi_sqrt = pi.sqrt();
+                            for (j, &dot_val) in dot_row.iter().enumerate() {
+                                let denom = pi_sqrt * l_norms[j];
+                                let cos_sim = if denom > 0.0 { dot_val / denom } else { 0.0 };
+                                buf.push((j as u32, (1.0 - cos_sim).max(0.0)));
+                            }
+                        }
+                        Metric::L2 => {
+                            let mut pi = 0.0f32;
+                            let row = &p_data[i * ndims..(i + 1) * ndims];
+                            for &v in row { pi += v * v; }
+                            for (j, &dot_val) in dot_row.iter().enumerate() {
+                                buf.push((j as u32, (pi + l_norms[j] - 2.0 * dot_val).max(0.0)));
+                            }
+                        }
+                        Metric::InnerProduct => {
+                            for (j, &dot_val) in dot_row.iter().enumerate() {
+                                buf.push((j as u32, -dot_val));
+                            }
+                        }
+                    }
+
+                    if num_assign > 0 && num_assign < buf.len() {
+                        buf.select_nth_unstable_by(num_assign - 1, |a, b| {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                    let out = &mut assign_chunk[i * num_assign..(i + 1) * num_assign];
+                    for k in 0..num_assign {
+                        out[k] = buf[k].0;
+                    }
+                }
+            });
+        // shard dropped here — data memory freed
+    }
+
+    // Aggregate into per-leader clusters (just IDs, no vectors).
+    let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); nl];
+    for i in 0..npoints {
+        let row = &assignments[i * num_assign..(i + 1) * num_assign];
+        for &li in row {
+            clusters[li as usize].push(i);
+        }
+    }
+    clusters
+}
+
 /// Quantized version of parallel_partition using Hamming distance on 1-bit data.
 pub fn parallel_partition_quantized(
     qdata: &crate::quantize::QuantizedData,
