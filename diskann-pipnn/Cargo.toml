@@ -23,6 +23,7 @@ serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = "0.12"
+memmap2 = "0.9"
 
 [dev-dependencies]
 criterion = { workspace = true }

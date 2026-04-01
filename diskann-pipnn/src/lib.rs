@@ -12,6 +12,7 @@
 //! 3. Merging edges from overlapping partitions using HashPrune (LSH-based online pruning)
 
 pub mod builder;
+pub mod data_source;
 pub mod gemm;
 pub mod hash_prune;
 pub mod leaf_build;
