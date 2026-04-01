@@ -4,7 +4,7 @@
 
 **Goal:** Implement the hidden over-budget PiPNN fallback as a whole-dataset, streaming RBC partition/build path that respects the build memory cap while preserving current PiPNN semantics and reusing existing PiPNN code.
 
-**Architecture:** Keep current one-shot PiPNN unchanged when the estimated peak fits the build memory limit. When the estimate exceeds the limit, do **not** switch to Vamana-style shard/merge. Instead, keep one logical PiPNN build and replace the memory-heavy whole-dataset partition materialization with a streaming RBC pipeline over the full dataset, then reuse the existing leaf build and HashPrune merge path. `final_prune=false` is the primary supported streaming target.
+**Architecture:** Keep current one-shot PiPNN unchanged when the estimated peak fits the build memory limit. When the estimate exceeds the limit, do **not** switch to Vamana-style shard/merge. Instead, keep one logical PiPNN build and replace the memory-heavy whole-dataset partition materialization with a streaming RBC pipeline over the full dataset, then reuse the existing leaf build and HashPrune merge path. For source-backed full-precision builds, large partition levels should use chunked contiguous reads plus one-shot-style GEMM assignment, retaining only top-`fanout` leader assignments; smaller or non-contiguous subtrees may fall back to the existing point-gather path. `final_prune=false` is the primary supported streaming target.
 
 **Tech Stack:** Rust, diskann-pipnn, diskann-disk, Rayon, existing PiPNN RBC partitioning, existing PiPNN leaf GEMM builder, existing PiPNN HashPrune.
 
@@ -61,6 +61,7 @@ No production-code changes for the streaming path before the failing tests are w
 - `diskann-pipnn/src/partition.rs`
   - `parallel_partition(...)` and `parallel_partition_quantized(...)` currently produce fully materialized leaves
   - `partition_assign(...)` already stripes assignment work and is the best reuse seam for streaming RBC
+  - `partition_assign_from_source(...)` is the current slow path and should become the strategy seam for chunked contiguous reads vs small-subtree gather fallback
 
 - `diskann-pipnn/src/hash_prune.rs`
   - current merge path already supports batched edge insertion
@@ -68,6 +69,17 @@ No production-code changes for the streaming path before the failing tests are w
 
 - `diskann-disk/src/build/builder/build.rs`
   - `build_pipnn_index_sync()` is the integration dispatch point for the hidden one-shot vs over-budget switch
+
+### Performance correction to keep in scope
+
+- The current file-backed path preserves recall/QPS and achieves the memory target, but it is much slower because partition uses repeated on-demand point gathers from disk.
+- The next implementation slice should improve **partition data access**, not change PiPNN graph semantics.
+- The preferred fix is:
+  1. contiguous chunk loads for large partition levels
+  2. in-memory GEMM against resident leaders
+  3. immediate extraction of top-`fanout` assignments
+  4. no materialization of the full point-to-leader distance matrix
+  5. small/non-contiguous subtree fallback may keep random point gathers
 
 ---
 

@@ -14,6 +14,16 @@ use crate::{PiPNNError, PiPNNResult};
 
 pub(crate) trait PointSource: Sync {
     fn copy_points_into(&self, indices: &[usize], out: &mut [f32]) -> PiPNNResult<()>;
+
+    fn copy_points_range_into(
+        &self,
+        start: usize,
+        count: usize,
+        out: &mut [f32],
+    ) -> PiPNNResult<()> {
+        let indices: Vec<usize> = (start..start + count).collect();
+        self.copy_points_into(&indices, out)
+    }
 }
 
 pub(crate) struct FilePointSource<'a, T, SP>
@@ -109,6 +119,67 @@ where
             T::as_f32_into(&typed_row, dst).expect("f32 conversion");
         }
 
+        Ok(())
+    }
+
+    fn copy_points_range_into(
+        &self,
+        start: usize,
+        count: usize,
+        out: &mut [f32],
+    ) -> PiPNNResult<()> {
+        let expected_len = count
+            .checked_mul(self.ndims)
+            .ok_or_else(|| PiPNNError::Config("point read size overflow".into()))?;
+        if out.len() != expected_len {
+            return Err(PiPNNError::DataLengthMismatch {
+                expected: expected_len,
+                actual: out.len(),
+                npoints: count,
+                ndims: self.ndims,
+            });
+        }
+        if start
+            .checked_add(count)
+            .is_none_or(|end| end > self.npoints)
+        {
+            return Err(PiPNNError::Config(format!(
+                "point range [{}..{}) out of bounds for {} points",
+                start,
+                start.saturating_add(count),
+                self.npoints
+            )));
+        }
+
+        let mut reader = self.storage_provider.open_reader(self.data_path)?;
+        let metadata = Metadata::read(&mut reader)?;
+        if metadata.npoints() != self.npoints || metadata.ndims() != self.ndims {
+            return Err(PiPNNError::Config(format!(
+                "dataset metadata changed while reading {}: expected {}x{}, found {}x{}",
+                self.data_path,
+                self.npoints,
+                self.ndims,
+                metadata.npoints(),
+                metadata.ndims()
+            )));
+        }
+
+        let row_bytes = self
+            .ndims
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| PiPNNError::Config("row byte size overflow".into()))?;
+        let offset = 8u64
+            .checked_add(
+                (start as u64)
+                    .checked_mul(row_bytes as u64)
+                    .ok_or_else(|| PiPNNError::Config("point offset overflow".into()))?,
+            )
+            .ok_or_else(|| PiPNNError::Config("point offset overflow".into()))?;
+        reader.seek(SeekFrom::Start(offset))?;
+
+        let mut typed_rows = vec![<T as bytemuck::Zeroable>::zeroed(); count * self.ndims];
+        reader.read_exact(bytemuck::must_cast_slice_mut::<T, u8>(&mut typed_rows))?;
+        T::as_f32_into(&typed_rows, out).expect("f32 conversion");
         Ok(())
     }
 }

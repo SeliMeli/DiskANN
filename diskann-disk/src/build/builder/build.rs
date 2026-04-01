@@ -1479,7 +1479,8 @@ mod start_point_tests {
 
         let one_shot_bytes =
             diskann_pipnn::builder::estimate_typed_peak_memory_bytes::<f32>(npoints, ndims, &config);
-        let budget_bytes = one_shot_bytes - (8 * 1024 * 1024);
+        let data_bytes = npoints * ndims * std::mem::size_of::<f32>();
+        let budget_bytes = one_shot_bytes - (data_bytes / 2).max(1);
 
         let result = diskann_pipnn::builder::build_streaming_from_file::<f32, _>(
             data_path.to_str().unwrap(),

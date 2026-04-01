@@ -844,7 +844,15 @@ fn partition_assign_from_source<S: PointSource>(
         let end = (start + stripe).min(np);
         let sn = end - start;
         let stripe_points = &points[start..end];
-        source.copy_points_into(stripe_points, &mut p_data[..sn * ndims])?;
+        if stripe_points
+            .first()
+            .zip(stripe_points.last())
+            .is_some_and(|(&first, &last)| last + 1 - first == stripe_points.len())
+        {
+            source.copy_points_range_into(stripe_points[0], sn, &mut p_data[..sn * ndims])?;
+        } else {
+            source.copy_points_into(stripe_points, &mut p_data[..sn * ndims])?;
+        }
 
         crate::gemm::sgemm_abt(
             &p_data[..sn * ndims],
@@ -1181,8 +1189,52 @@ fn partition_quantized_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use diskann_vector::distance::Metric;
     use rand::{Rng, SeedableRng};
+
+    struct RecordingPointSource {
+        data: Vec<f32>,
+        ndims: usize,
+        gather_calls: AtomicUsize,
+        range_calls: AtomicUsize,
+    }
+
+    impl RecordingPointSource {
+        fn new(data: Vec<f32>, ndims: usize) -> Self {
+            Self {
+                data,
+                ndims,
+                gather_calls: AtomicUsize::new(0),
+                range_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PointSource for RecordingPointSource {
+        fn copy_points_into(&self, indices: &[usize], out: &mut [f32]) -> PiPNNResult<()> {
+            self.gather_calls.fetch_add(1, Ordering::Relaxed);
+            for (row_idx, &point_idx) in indices.iter().enumerate() {
+                let src = &self.data[point_idx * self.ndims..(point_idx + 1) * self.ndims];
+                let dst = &mut out[row_idx * self.ndims..(row_idx + 1) * self.ndims];
+                dst.copy_from_slice(src);
+            }
+            Ok(())
+        }
+
+        fn copy_points_range_into(
+            &self,
+            start: usize,
+            count: usize,
+            out: &mut [f32],
+        ) -> PiPNNResult<()> {
+            self.range_calls.fetch_add(1, Ordering::Relaxed);
+            let src = &self.data[start * self.ndims..(start + count) * self.ndims];
+            out.copy_from_slice(src);
+            Ok(())
+        }
+    }
 
     fn gen_data(npoints: usize, ndims: usize, seed: u64) -> Vec<f32> {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -1710,5 +1762,60 @@ mod tests {
         };
 
         assert_eq!(normalize(expected), normalize(streamed));
+    }
+
+    #[test]
+    fn test_partition_assign_from_source_uses_range_reads_for_contiguous_points() {
+        let npoints = 512;
+        let ndims = 8;
+        let data = gen_data(npoints, ndims, 2026);
+        let points: Vec<usize> = (0..npoints).collect();
+        let leaders = vec![3usize, 97, 211, 400];
+        let fanout = 2;
+
+        let expected = partition_assign(&data, ndims, &points, &leaders, fanout, Metric::L2);
+        let source = RecordingPointSource::new(data, ndims);
+        let actual =
+            partition_assign_from_source(&source, ndims, &points, &leaders, fanout, Metric::L2)
+                .unwrap();
+
+        assert_eq!(expected, actual);
+        assert_eq!(
+            source.gather_calls.load(Ordering::Relaxed),
+            1,
+            "only leaders should use point-gather reads for contiguous top-level points"
+        );
+        assert!(
+            source.range_calls.load(Ordering::Relaxed) > 0,
+            "contiguous point stripes should use range reads"
+        );
+    }
+
+    #[test]
+    fn test_partition_assign_from_source_falls_back_to_gather_for_noncontiguous_points() {
+        let npoints = 256;
+        let ndims = 6;
+        let data = gen_data(npoints, ndims, 3030);
+        let mut points: Vec<usize> = (0..npoints).collect();
+        points.rotate_left(19);
+        let leaders = vec![5usize, 44, 128, 190];
+        let fanout = 2;
+
+        let expected = partition_assign(&data, ndims, &points, &leaders, fanout, Metric::L2);
+        let source = RecordingPointSource::new(data, ndims);
+        let actual =
+            partition_assign_from_source(&source, ndims, &points, &leaders, fanout, Metric::L2)
+                .unwrap();
+
+        assert_eq!(expected, actual);
+        assert_eq!(
+            source.range_calls.load(Ordering::Relaxed),
+            0,
+            "noncontiguous subtree points should stay on gather fallback"
+        );
+        assert!(
+            source.gather_calls.load(Ordering::Relaxed) > 1,
+            "noncontiguous subtree points should trigger gather reads beyond leaders"
+        );
     }
 }

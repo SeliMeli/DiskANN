@@ -378,7 +378,7 @@ fn estimate_leaf_buffer_bytes(config: &PiPNNConfig, num_threads: usize) -> usize
 
 fn estimate_typed_streaming_peak_memory_bytes<T>(
     npoints: usize,
-    ndims: usize,
+    _ndims: usize,
     config: &PiPNNConfig,
 ) -> usize {
     const HASH_PRUNE_SLOT_BYTES: usize = 8;
