@@ -385,9 +385,8 @@ fn estimate_typed_streaming_peak_memory_bytes<T>(
     const OVERHEAD_BYTES: usize = 150 * 1024 * 1024;
 
     let num_threads = effective_num_threads(config);
-    let data = npoints
-        .saturating_mul(ndims)
-        .saturating_mul(std::mem::size_of::<T>());
+    // Streaming path reads data from file — NOT fully resident in memory.
+    // Only fixed structures (reservoirs, sketches) + working buffers are resident.
     let reservoirs = npoints
         .saturating_mul(config.l_max)
         .saturating_mul(HASH_PRUNE_SLOT_BYTES);
@@ -395,8 +394,9 @@ fn estimate_typed_streaming_peak_memory_bytes<T>(
         .saturating_mul(config.num_hash_planes)
         .saturating_mul(std::mem::size_of::<f32>());
 
-    data.saturating_add(reservoirs)
+    reservoirs
         .saturating_add(sketches)
+        .saturating_add(estimate_partition_buffer_bytes(num_threads))
         .saturating_add(estimate_leaf_buffer_bytes(config, num_threads))
         .saturating_add(OVERHEAD_BYTES)
 }
@@ -2303,7 +2303,9 @@ mod tests {
         let one_shot_graph = build_typed::<f32>(&data, npoints, ndims, &config)
             .expect("one-shot build should succeed for the baseline comparison");
         let estimated_one_shot = estimate_typed_peak_memory_bytes::<f32>(npoints, ndims, &config);
-        let streaming_budget = estimated_one_shot - (8 * 1024 * 1024);
+        let estimated_streaming =
+            estimate_typed_streaming_peak_memory_bytes::<f32>(npoints, ndims, &config);
+        let streaming_budget = estimated_streaming + 1024;
 
         assert!(
             streaming_budget < estimated_one_shot,
