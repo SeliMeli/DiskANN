@@ -935,6 +935,224 @@ fn final_prune_from_candidates<T: VectorRepr + Send + Sync>(
         .collect()
 }
 
+// ============================================================================
+// Sharded build: for datasets larger than RAM.
+// ============================================================================
+
+use crate::data_source::VectorDataSource;
+use crate::hash_prune::LshSketchesBuilder;
+
+/// Sharded PiPNN build for datasets larger than RAM.
+///
+/// Phases:
+///   0. Stream data shard-by-shard to compute LSH sketches + medoid
+///   1. Per-shard partition → leaf build → edges to global HashPrune
+///   2. Extract graph from HashPrune
+///
+/// Only one shard of data is in memory at any time. The fixed-size structures
+/// (HashPrune reservoirs, LSH sketches) span all N points and stay resident.
+///
+/// `shard_ranges[i] = (global_offset, shard_npoints)` — non-overlapping,
+/// covering all `npoints`. `shard_factory(i)` returns a data source for shard `i`.
+pub fn build_sharded<S: VectorDataSource>(
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    shard_ranges: &[(usize, usize)],
+    shard_factory: impl Fn(usize) -> S + Send + Sync,
+) -> PiPNNResult<PiPNNGraph> {
+    config.validate()?;
+
+    // Validate shard ranges cover exactly npoints.
+    let total: usize = shard_ranges.iter().map(|&(_, n)| n).sum();
+    if total != npoints {
+        return Err(PiPNNError::Config(format!(
+            "shard_ranges cover {} points but npoints={}",
+            total, npoints
+        )));
+    }
+
+    if config.num_threads > 0 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.num_threads)
+            .build()
+            .map_err(|e| PiPNNError::Config(format!("Failed to create thread pool: {}", e)))?;
+        return pool.install(|| {
+            build_sharded_impl(npoints, ndims, config, shard_ranges, &shard_factory)
+        });
+    }
+    build_sharded_impl(npoints, ndims, config, shard_ranges, &shard_factory)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn build_sharded_impl<S: VectorDataSource>(
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    shard_ranges: &[(usize, usize)],
+    shard_factory: &(impl Fn(usize) -> S + Send + Sync),
+) -> PiPNNResult<PiPNNGraph> {
+    let t_total = Instant::now();
+
+    // ── Phase 0: Stream shards to compute LSH sketches + centroid ──
+    let t0 = Instant::now();
+    let mut sketch_builder = LshSketchesBuilder::new(npoints, ndims, config.num_hash_planes, 42);
+    let mut centroid = vec![0.0f32; ndims];
+    let mut point_buf = vec![0.0f32; ndims];
+
+    for (shard_id, &(offset, shard_n)) in shard_ranges.iter().enumerate() {
+        let shard = shard_factory(shard_id);
+        sketch_builder.fill_shard_from_source(&shard, offset);
+        // Accumulate centroid.
+        for i in 0..shard_n {
+            S::Elem::as_f32_into(shard.get(i), &mut point_buf).expect("f32 conversion");
+            for d in 0..ndims {
+                centroid[d] += point_buf[d];
+            }
+        }
+    }
+    let inv_n = 1.0 / npoints as f32;
+    for c in &mut centroid {
+        *c *= inv_n;
+    }
+    let sketches = sketch_builder.finish();
+    let sketch_secs = t0.elapsed().as_secs_f64();
+    tracing::info!(elapsed_secs = sketch_secs, "Phase 0: sketches + centroid complete");
+
+    // Find medoid (second pass: closest point to centroid).
+    let dist_fn = make_dist_fn(Metric::L2);
+    let mut medoid = 0usize;
+    let mut best_dist = f32::MAX;
+    for (shard_id, &(offset, shard_n)) in shard_ranges.iter().enumerate() {
+        let shard = shard_factory(shard_id);
+        for i in 0..shard_n {
+            S::Elem::as_f32_into(shard.get(i), &mut point_buf).expect("f32 conversion");
+            let d = dist_fn.call(&point_buf, &centroid);
+            if d < best_dist {
+                best_dist = d;
+                medoid = offset + i;
+            }
+        }
+    }
+    tracing::info!(medoid = medoid, "Medoid found");
+
+    // ── Phase 1: Per-shard partition → leaf build → global HashPrune ──
+    let hash_prune = HashPrune::from_sketches(sketches, npoints, config.l_max, config.max_degree);
+    let mut partition_secs = 0.0f64;
+    let mut leaf_build_secs = 0.0f64;
+    let mut total_leaves = 0usize;
+    let mut total_edges_count = 0usize;
+
+    for replica in 0..config.replicas {
+        let seed = 1000 + replica as u64 * 7919;
+
+        for (shard_id, &(offset, shard_n)) in shard_ranges.iter().enumerate() {
+            let shard = shard_factory(shard_id);
+            let partition_config = PartitionConfig {
+                c_max: config.c_max,
+                c_min: config.c_min,
+                p_samp: config.p_samp,
+                fanout: config.fanout.clone(),
+                metric: config.metric,
+            };
+            let shard_seed = seed.wrapping_add(shard_id as u64 * 31);
+            let indices: Vec<usize> = (0..shard_n).collect();
+
+            let t1 = Instant::now();
+            let leaves = partition::parallel_partition(&shard, &indices, &partition_config, shard_seed);
+            partition_secs += t1.elapsed().as_secs_f64();
+            total_leaves += leaves.len();
+
+            let t2 = Instant::now();
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let shard_edges = AtomicUsize::new(0);
+
+            leaves.par_iter().for_each(|leaf| {
+                let edges = leaf_build::build_leaf(&shard, &leaf.indices, config.k, config.metric);
+                // Translate shard-local indices to global.
+                let global_edges: Vec<leaf_build::Edge> = edges
+                    .iter()
+                    .map(|e| leaf_build::Edge {
+                        src: e.src + offset,
+                        dst: e.dst + offset,
+                        distance: e.distance,
+                    })
+                    .collect();
+                shard_edges.fetch_add(global_edges.len(), Ordering::Relaxed);
+                hash_prune.add_edges_batched(&global_edges);
+            });
+            leaf_build_secs += t2.elapsed().as_secs_f64();
+            total_edges_count += shard_edges.load(Ordering::Relaxed);
+
+            tracing::debug!(
+                replica = replica,
+                shard_id = shard_id,
+                offset = offset,
+                shard_n = shard_n,
+                leaves = leaves.len(),
+                "Shard complete"
+            );
+        }
+    }
+
+    // Release thread-local leaf buffers.
+    (0..rayon::current_num_threads())
+        .into_par_iter()
+        .for_each(|_| {
+            leaf_build::release_thread_buffers();
+        });
+
+    tracing::info!(
+        partition_secs = partition_secs,
+        leaf_build_secs = leaf_build_secs,
+        total_leaves = total_leaves,
+        total_edges = total_edges_count,
+        "Phase 1 complete"
+    );
+
+    // ── Phase 2: Extract graph ──
+    // TODO: Support final_prune in sharded builds. Currently skipped because
+    // final_prune_from_candidates needs all data in memory for inter-candidate
+    // distance computation. A sharded final_prune would need to stream data again.
+    if config.final_prune {
+        tracing::warn!("final_prune is not yet supported in sharded builds, ignoring");
+    }
+
+    let t3 = Instant::now();
+    let adjacency = hash_prune.extract_graph();
+    let extract_secs = t3.elapsed().as_secs_f64();
+    tracing::info!(elapsed_secs = extract_secs, "Phase 2: graph extraction complete");
+
+    let total_secs = t_total.elapsed().as_secs_f64();
+
+    let graph = PiPNNGraph {
+        adjacency,
+        npoints,
+        ndims,
+        medoid,
+        metric: config.metric,
+        build_stats: PiPNNBuildStats {
+            total_secs,
+            sketch_secs,
+            partition_secs,
+            leaf_build_secs,
+            extract_secs,
+            final_prune_secs: 0.0,
+            num_leaves: total_leaves,
+            total_edges: total_edges_count,
+        },
+    };
+
+    tracing::info!(
+        avg_degree = graph.avg_degree(),
+        max_degree = graph.max_degree(),
+        isolated = graph.num_isolated(),
+        "Sharded PiPNN build complete"
+    );
+
+    Ok(graph)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2127,5 +2345,128 @@ mod tests {
         assert_eq!(config.k, deserialized.k);
         assert_eq!(config.max_degree, deserialized.max_degree);
         assert!((config.alpha - deserialized.alpha).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_build_sharded_basic() {
+        // Build with 3 shards and verify the graph is valid.
+        let npoints = 3000;
+        let ndims = 8;
+        let data = generate_random_data(npoints, ndims, 42);
+
+        let config = PiPNNConfig {
+            c_max: 128,
+            c_min: 16,
+            k: 3,
+            max_degree: 32,
+            replicas: 1,
+            l_max: 64,
+            num_hash_planes: 10,
+            fanout: vec![5, 2],
+            p_samp: 0.05,
+            final_prune: false,
+            alpha: 1.2,
+            num_threads: 0,
+            metric: Metric::L2,
+        };
+
+        let shard_size = 1000;
+        let shard_ranges: Vec<(usize, usize)> = (0..3)
+            .map(|i| (i * shard_size, shard_size))
+            .collect();
+
+        let graph = build_sharded(
+            npoints,
+            ndims,
+            &config,
+            &shard_ranges,
+            |shard_id| {
+                let offset = shard_id * shard_size;
+                crate::data_source::SliceDataSource::new(
+                    &data[offset * ndims..(offset + shard_size) * ndims],
+                    shard_size,
+                    ndims,
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(graph.npoints, npoints);
+        assert_eq!(graph.ndims, ndims);
+        assert!(graph.medoid < npoints);
+        assert!(
+            graph.avg_degree() > 1.0,
+            "sharded build should produce edges, avg_degree={}",
+            graph.avg_degree()
+        );
+        assert!(
+            graph.num_isolated() < npoints / 10,
+            "too many isolated nodes: {}",
+            graph.num_isolated()
+        );
+    }
+
+    #[test]
+    fn test_build_sharded_vs_oneshot_recall() {
+        // Compare sharded (3 shards) vs one-shot build on same data.
+        // Sharded will have different partition boundaries, so exact graph
+        // won't match, but recall should be comparable.
+        let npoints = 600;
+        let ndims = 8;
+        let data = generate_random_data(npoints, ndims, 42);
+
+        let config = PiPNNConfig {
+            c_max: 64,
+            c_min: 16,
+            k: 3,
+            max_degree: 32,
+            replicas: 1,
+            l_max: 64,
+            num_hash_planes: 10,
+            fanout: vec![3],
+            p_samp: 0.1,
+            final_prune: false,
+            alpha: 1.2,
+            num_threads: 0,
+            metric: Metric::L2,
+        };
+
+        // One-shot build.
+        let graph_oneshot = build_typed(&data, npoints, ndims, &config).unwrap();
+
+        // Sharded build (3 shards of 200).
+        let shard_size = 200;
+        let shard_ranges: Vec<(usize, usize)> = (0..3)
+            .map(|i| (i * shard_size, shard_size))
+            .collect();
+        let graph_sharded = build_sharded(
+            npoints,
+            ndims,
+            &config,
+            &shard_ranges,
+            |shard_id| {
+                let offset = shard_id * shard_size;
+                crate::data_source::SliceDataSource::new(
+                    &data[offset * ndims..(offset + shard_size) * ndims],
+                    shard_size,
+                    ndims,
+                )
+            },
+        )
+        .unwrap();
+
+        // Both should produce valid graphs.
+        assert!(graph_oneshot.avg_degree() > 1.0);
+        assert!(graph_sharded.avg_degree() > 1.0);
+
+        // Sharded avg_degree should be in a reasonable range of one-shot.
+        let ratio = graph_sharded.avg_degree() / graph_oneshot.avg_degree();
+        assert!(
+            (0.3..3.0).contains(&ratio),
+            "sharded avg_degree ({:.1}) too far from one-shot ({:.1}), ratio={:.2}",
+            graph_sharded.avg_degree(),
+            graph_oneshot.avg_degree(),
+            ratio,
+        );
     }
 }

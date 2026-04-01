@@ -92,6 +92,43 @@ impl LshSketchesBuilder {
             });
     }
 
+    /// Compute sketches from a VectorDataSource for points [global_offset..+data.npoints()).
+    /// Use for sharded builds where data comes from MmapDataSource windows.
+    #[allow(clippy::disallowed_methods)]
+    pub fn fill_shard_from_source<D: crate::data_source::VectorDataSource>(
+        &mut self, data: &D, global_offset: usize,
+    ) {
+        let shard_npoints = data.npoints();
+        debug_assert!(global_offset + shard_npoints <= self.npoints);
+        let ndims = self.ndims;
+        let num_planes = self.num_planes;
+        let hyperplanes = &self.hyperplanes;
+
+        let shard_sketches = &mut self.sketches[global_offset * num_planes..(global_offset + shard_npoints) * num_planes];
+        shard_sketches
+            .par_chunks_mut(num_planes)
+            .enumerate()
+            .for_each(|(i, sketch_row)| {
+                thread_local! {
+                    static SRC_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+                }
+                SRC_BUF.with(|cell| {
+                    let mut buf = cell.borrow_mut();
+                    buf.resize(ndims, 0.0);
+                    D::Elem::as_f32_into(data.get(i), &mut buf)
+                        .expect("f32 conversion");
+                    for j in 0..num_planes {
+                        let plane = &hyperplanes[j * ndims..(j + 1) * ndims];
+                        let mut dot = 0.0f32;
+                        for d in 0..ndims {
+                            unsafe { dot += *buf.get_unchecked(d) * *plane.get_unchecked(d); }
+                        }
+                        sketch_row[j] = dot;
+                    }
+                });
+            });
+    }
+
     /// Compute sketches from 1-bit quantized data for points [global_offset..+shard_npoints).
     #[allow(clippy::disallowed_methods)]
     pub fn fill_shard_quantized(
