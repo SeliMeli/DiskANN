@@ -653,6 +653,7 @@ pub(crate) mod disk_index_builder_tests {
     use super::*;
     use crate::{
         build::builder::build::DiskIndexBuilder,
+        build::configuration::BuildAlgorithm,
         data_model::{CachingStrategy, GraphHeader},
         disk_index_build_parameter::{DiskIndexBuildParameters, MemoryBudget, NumPQChunks},
         search::provider::{
@@ -687,6 +688,7 @@ pub(crate) mod disk_index_builder_tests {
         pub checkpoint_params: Option<CheckpointParams>,
         pub num_threads: usize,
         pub metric: Metric,
+        pub build_algorithm: BuildAlgorithm,
     }
 
     impl Default for TestParams {
@@ -705,6 +707,7 @@ pub(crate) mod disk_index_builder_tests {
                 checkpoint_params: None,
                 num_threads: 1,
                 metric: L2,
+                build_algorithm: BuildAlgorithm::Vamana,
             }
         }
     }
@@ -761,10 +764,11 @@ pub(crate) mod disk_index_builder_tests {
             StorageProvider::Reader: std::marker::Send + Read,
         {
             // Create disk index build parameters
-            let disk_index_build_parameters = DiskIndexBuildParameters::new(
+            let disk_index_build_parameters = DiskIndexBuildParameters::new_with_algorithm(
                 MemoryBudget::try_from_gb(self.params.index_build_ram_gb)?,
                 self.params.build_quantization_type,
                 NumPQChunks::new_with(self.params.num_pq_chunks, self.params.full_dim)?,
+                self.params.build_algorithm.clone(),
             );
 
             let config = config::Builder::new_with(

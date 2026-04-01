@@ -499,8 +499,15 @@ where
                 // peak RSS for f16 data).
                 let (npoints, ndims, data) =
                     load_data_typed::<Data::VectorDataType, _>(&data_path, self.storage_provider)?;
-                builder::build_typed(&data, npoints, ndims, &config)
-                    .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
+                let memory_budget_bytes = self.disk_build_param.build_memory_limit().in_bytes();
+                builder::build_typed_sharded_scaffold(
+                    &data,
+                    npoints,
+                    ndims,
+                    &config,
+                    memory_budget_bytes,
+                )
+                .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
             }
         };
 

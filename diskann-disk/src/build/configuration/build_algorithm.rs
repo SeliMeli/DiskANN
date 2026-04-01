@@ -306,4 +306,29 @@ mod tests {
         assert_eq!(config.max_degree, 64);
         assert_eq!(config.alpha, 1.2);
     }
+
+    #[test]
+    #[cfg(feature = "pipnn")]
+    fn test_pipnn_build_plan_switches_to_streaming_when_over_budget() {
+        let algo = BuildAlgorithm::PiPNN {
+            c_max: 512,
+            c_min: 128,
+            p_samp: 0.01,
+            fanout: vec![8],
+            leaf_k: 5,
+            replicas: 1,
+            l_max: 128,
+            num_hash_planes: 12,
+            final_prune: false,
+        };
+        let config = algo
+            .to_pipnn_config(64, diskann_vector::distance::Metric::L2, 1.2, 16)
+            .expect("PiPNN config should be produced");
+
+        let decision = diskann_pipnn::builder::choose_typed_build_plan::<f32>(128, 16, &config, 1);
+        assert!(matches!(
+            decision,
+            diskann_pipnn::builder::PiPNNBuildPlan::NeedsSharded { .. }
+        ));
+    }
 }

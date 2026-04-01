@@ -509,6 +509,13 @@ impl HashPrune {
 mod tests {
     use super::*;
 
+    fn sorted_graph(mut graph: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
+        for neighbors in &mut graph {
+            neighbors.sort_unstable();
+        }
+        graph
+    }
+
     #[test]
     fn test_reservoir_basic() {
         let mut reservoir = HashPruneReservoir::new(3);
@@ -847,5 +854,46 @@ mod tests {
             !graph[2].is_empty(),
             "node 2 should have neighbors after batched add"
         );
+    }
+
+    #[test]
+    fn test_shard_edge_batches_match_monolithic_hash_prune() {
+        let data = vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let npoints = 4;
+        let ndims = 2;
+        let num_planes = 6;
+        let l_max = 4;
+        let max_degree = 2;
+        let seed = 7;
+
+        let all_edges = vec![
+            (0usize, 1usize, 1.0f32),
+            (0, 2, 1.0),
+            (1, 0, 1.0),
+            (1, 3, 1.0),
+            (2, 0, 1.0),
+            (2, 3, 1.0),
+            (3, 1, 1.0),
+            (3, 2, 1.0),
+            (0, 3, 2.0),
+            (3, 0, 2.0),
+        ];
+
+        let monolithic = {
+            let hp = HashPrune::new(&data, npoints, ndims, num_planes, l_max, max_degree, seed);
+            hp.add_edges_parallel(&all_edges);
+            sorted_graph(hp.extract_graph())
+        };
+
+        let shard_a = &all_edges[..5];
+        let shard_b = &all_edges[5..];
+        let merged = {
+            let hp = HashPrune::new(&data, npoints, ndims, num_planes, l_max, max_degree, seed);
+            hp.add_edges_parallel(shard_a);
+            hp.add_edges_parallel(shard_b);
+            sorted_graph(hp.extract_graph())
+        };
+
+        assert_eq!(merged, monolithic);
     }
 }

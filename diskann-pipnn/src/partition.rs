@@ -322,11 +322,16 @@ fn merge_small_quantized(
     let mut large: Vec<Vec<usize>> = Vec::new();
     let mut smalls: Vec<Vec<usize>> = Vec::new();
     for c in clusters.drain(..) {
-        if c.len() < c_min && !c.is_empty() { smalls.push(c); }
-        else if !c.is_empty() { large.push(c); }
+        if c.len() < c_min && !c.is_empty() {
+            smalls.push(c);
+        } else if !c.is_empty() {
+            large.push(c);
+        }
     }
     if smalls.is_empty() || large.is_empty() {
-        if large.is_empty() { return smalls; }
+        if large.is_empty() {
+            return smalls;
+        }
         return large;
     }
 
@@ -334,30 +339,33 @@ fn merge_small_quantized(
 
     // Compute majority-vote bitwise centroid for each large cluster.
     // For each u64 word and each bit position, set the bit if >50% of points have it set.
-    let large_centroids: Vec<Vec<u64>> = large.iter().map(|c| {
-        let half = c.len() / 2;
-        let mut centroid = vec![0u64; u64s];
-        let mut counts = vec![0u32; u64s * 64];
-        for &idx in c {
-            let bits = qdata.get_u64(idx);
-            for (w, &word) in bits.iter().enumerate() {
-                let mut b = word;
-                while b != 0 {
-                    let bit = b.trailing_zeros() as usize;
-                    counts[w * 64 + bit] += 1;
-                    b &= b - 1;
+    let large_centroids: Vec<Vec<u64>> = large
+        .iter()
+        .map(|c| {
+            let half = c.len() / 2;
+            let mut centroid = vec![0u64; u64s];
+            let mut counts = vec![0u32; u64s * 64];
+            for &idx in c {
+                let bits = qdata.get_u64(idx);
+                for (w, &word) in bits.iter().enumerate() {
+                    let mut b = word;
+                    while b != 0 {
+                        let bit = b.trailing_zeros() as usize;
+                        counts[w * 64 + bit] += 1;
+                        b &= b - 1;
+                    }
                 }
             }
-        }
-        for (w, cw) in centroid.iter_mut().enumerate() {
-            for bit in 0..64 {
-                if counts[w * 64 + bit] > half as u32 {
-                    *cw |= 1u64 << bit;
+            for (w, cw) in centroid.iter_mut().enumerate() {
+                for bit in 0..64 {
+                    if counts[w * 64 + bit] > half as u32 {
+                        *cw |= 1u64 << bit;
+                    }
                 }
             }
-        }
-        centroid
-    }).collect();
+            centroid
+        })
+        .collect();
 
     for small in smalls {
         // Compute small cluster centroid.
@@ -384,7 +392,9 @@ fn merge_small_quantized(
         }
 
         // Find nearest large cluster by centroid-to-centroid Hamming distance.
-        let nearest = large_centroids.iter().enumerate()
+        let nearest = large_centroids
+            .iter()
+            .enumerate()
             .map(|(i, lc)| {
                 let d = crate::quantize::QuantizedData::hamming_u64(&small_centroid, lc);
                 (i, d)
@@ -454,9 +464,13 @@ fn merge_small_into_nearest<T: VectorRepr>(
         for &idx in &small {
             T::as_f32_into(&data[idx * ndims..(idx + 1) * ndims], &mut point_buf)
                 .expect("f32 conversion");
-            for d in 0..ndims { rep_buf[d] += point_buf[d]; }
+            for d in 0..ndims {
+                rep_buf[d] += point_buf[d];
+            }
         }
-        for d in 0..ndims { rep_buf[d] *= inv; }
+        for d in 0..ndims {
+            rep_buf[d] *= inv;
+        }
         let nearest = centroids
             .iter()
             .enumerate()
@@ -641,6 +655,55 @@ pub fn parallel_partition<T: VectorRepr + Send + Sync>(
         "partition recursion complete"
     );
     results.into_iter().flatten().collect()
+}
+
+pub fn stream_partition_subtrees<T: VectorRepr + Send + Sync, F: FnMut(Vec<Leaf>)>(
+    data: &[T],
+    ndims: usize,
+    indices: &[usize],
+    config: &PartitionConfig,
+    seed: u64,
+    mut emit: F,
+) {
+    let n = indices.len();
+
+    if n <= config.c_max {
+        emit(vec![Leaf {
+            indices: indices.to_vec(),
+        }]);
+        return;
+    }
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let fanout = if !config.fanout.is_empty() {
+        config.fanout[0]
+    } else {
+        3
+    };
+
+    let num_leaders = sample_num_leaders(n, config.p_samp);
+    let leaders: Vec<usize> = indices
+        .choose_multiple(&mut rng, num_leaders)
+        .copied()
+        .collect();
+
+    let clusters_local = partition_assign(data, ndims, indices, &leaders, fanout, config.metric);
+    let clusters: Vec<Vec<usize>> = clusters_local
+        .into_iter()
+        .map(|local_cluster| local_cluster.into_iter().map(|li| indices[li]).collect())
+        .collect();
+
+    let merged_clusters = merge_small_into_nearest(data, ndims, clusters, config.c_min);
+    let sub_seeds: Vec<u64> = (0..merged_clusters.len()).map(|_| rng.random()).collect();
+
+    for (cluster, sub_seed) in merged_clusters.into_iter().zip(sub_seeds.into_iter()) {
+        if cluster.len() <= config.c_max {
+            emit(vec![Leaf { indices: cluster }]);
+        } else {
+            let mut sub_rng = rand::rngs::StdRng::seed_from_u64(sub_seed);
+            emit(partition(data, ndims, &cluster, config, 1, &mut sub_rng));
+        }
+    }
 }
 
 /// Quantized version of parallel_partition using Hamming distance on 1-bit data.
@@ -1284,5 +1347,41 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_stream_partition_subtrees_matches_materialized_parallel_partition() {
+        let npoints = 400;
+        let ndims = 4;
+        let data = gen_data(npoints, ndims, 777);
+        let indices: Vec<usize> = (0..npoints).collect();
+        let config = PartitionConfig {
+            c_max: 48,
+            c_min: 12,
+            p_samp: 0.08,
+            fanout: vec![4, 2],
+            metric: Metric::L2,
+        };
+        let seed = 12345;
+
+        let expected = parallel_partition(&data, ndims, &indices, &config, seed);
+        let mut streamed = Vec::new();
+        stream_partition_subtrees(&data, ndims, &indices, &config, seed, |batch| {
+            streamed.extend(batch);
+        });
+
+        let normalize = |mut leaves: Vec<Leaf>| {
+            let mut normalized: Vec<Vec<usize>> = leaves
+                .drain(..)
+                .map(|mut leaf| {
+                    leaf.indices.sort_unstable();
+                    leaf.indices
+                })
+                .collect();
+            normalized.sort();
+            normalized
+        };
+
+        assert_eq!(normalize(expected), normalize(streamed));
     }
 }

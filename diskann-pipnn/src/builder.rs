@@ -297,6 +297,277 @@ fn find_medoid<T: VectorRepr>(data: &[T], npoints: usize, ndims: usize) -> usize
     best_idx
 }
 
+fn effective_num_threads(config: &PiPNNConfig) -> usize {
+    if config.num_threads > 0 {
+        config.num_threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+}
+
+fn estimate_partition_buffer_bytes(num_threads: usize) -> usize {
+    num_threads.saturating_mul(16 * 1024 * 1024)
+}
+
+fn estimate_leaf_buffer_bytes(config: &PiPNNConfig, num_threads: usize) -> usize {
+    num_threads
+        .saturating_mul(config.c_max)
+        .saturating_mul(config.c_max)
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+fn estimate_typed_streaming_peak_memory_bytes<T>(
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+) -> usize {
+    const HASH_PRUNE_SLOT_BYTES: usize = 8;
+    const OVERHEAD_BYTES: usize = 150 * 1024 * 1024;
+
+    let num_threads = effective_num_threads(config);
+    let data = npoints
+        .saturating_mul(ndims)
+        .saturating_mul(std::mem::size_of::<T>());
+    let reservoirs = npoints
+        .saturating_mul(config.l_max)
+        .saturating_mul(HASH_PRUNE_SLOT_BYTES);
+    let sketches = npoints
+        .saturating_mul(config.num_hash_planes)
+        .saturating_mul(std::mem::size_of::<f32>());
+
+    data.saturating_add(reservoirs)
+        .saturating_add(sketches)
+        .saturating_add(estimate_leaf_buffer_bytes(config, num_threads))
+        .saturating_add(OVERHEAD_BYTES)
+}
+
+pub fn estimate_typed_peak_memory_bytes<T>(
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+) -> usize {
+    const HASH_PRUNE_SLOT_BYTES: usize = 8;
+    const OVERHEAD_BYTES: usize = 150 * 1024 * 1024;
+
+    let num_threads = effective_num_threads(config);
+    let data = npoints
+        .saturating_mul(ndims)
+        .saturating_mul(std::mem::size_of::<T>());
+    let reservoirs = npoints
+        .saturating_mul(config.l_max)
+        .saturating_mul(HASH_PRUNE_SLOT_BYTES);
+    let sketches = npoints
+        .saturating_mul(config.num_hash_planes)
+        .saturating_mul(std::mem::size_of::<f32>());
+
+    data.saturating_add(reservoirs)
+        .saturating_add(sketches)
+        .saturating_add(estimate_partition_buffer_bytes(num_threads))
+        .saturating_add(estimate_leaf_buffer_bytes(config, num_threads))
+        .saturating_add(OVERHEAD_BYTES)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiPNNBuildPlan {
+    OneShot { estimated_peak_bytes: usize },
+    NeedsSharded { estimated_peak_bytes: usize },
+}
+
+pub fn choose_typed_build_plan<T>(
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    memory_budget_bytes: usize,
+) -> PiPNNBuildPlan {
+    let estimated_peak_bytes = estimate_typed_peak_memory_bytes::<T>(npoints, ndims, config);
+    if estimated_peak_bytes > memory_budget_bytes {
+        PiPNNBuildPlan::NeedsSharded {
+            estimated_peak_bytes,
+        }
+    } else {
+        PiPNNBuildPlan::OneShot {
+            estimated_peak_bytes,
+        }
+    }
+}
+
+fn streaming_build_impossible_error(
+    memory_budget_bytes: usize,
+    estimated_streaming_peak_bytes: usize,
+    estimated_one_shot_peak_bytes: usize,
+) -> PiPNNError {
+    PiPNNError::Config(format!(
+        "build memory budget {memory_budget_bytes} bytes is below estimated PiPNN streaming floor {estimated_streaming_peak_bytes} bytes and below estimated one-shot PiPNN peak {estimated_one_shot_peak_bytes} bytes"
+    ))
+}
+
+fn build_internal_streaming<T: VectorRepr + Send + Sync>(
+    data: &[T],
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+) -> PiPNNResult<PiPNNGraph> {
+    if config.num_threads > 0 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.num_threads)
+            .build()
+            .map_err(|e| PiPNNError::Config(format!("Failed to create thread pool: {}", e)))?;
+        return pool.install(|| build_internal_streaming_impl(data, npoints, ndims, config));
+    }
+    build_internal_streaming_impl(data, npoints, ndims, config)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn build_internal_streaming_impl<T: VectorRepr + Send + Sync>(
+    data: &[T],
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+) -> PiPNNResult<PiPNNGraph> {
+    if config.final_prune {
+        return Err(PiPNNError::Config(
+            "final_prune=true is not supported for the over-budget streaming PiPNN path yet".into(),
+        ));
+    }
+
+    let t_total = Instant::now();
+    let medoid = find_medoid(data, npoints, ndims);
+
+    let t0 = Instant::now();
+    let hash_prune = HashPrune::new(
+        data,
+        npoints,
+        ndims,
+        config.num_hash_planes,
+        config.l_max,
+        config.max_degree,
+        42,
+    );
+    let sketch_secs = t0.elapsed().as_secs_f64();
+    tracing::info!(elapsed_secs = sketch_secs, "HashPrune init complete");
+
+    let mut partition_secs = 0.0f64;
+    let mut leaf_build_secs = 0.0f64;
+    let mut total_leaves = 0usize;
+    let mut total_edges_count = 0usize;
+
+    for replica in 0..config.replicas {
+        let seed = 1000 + replica as u64 * 7919;
+        let partition_config = PartitionConfig {
+            c_max: config.c_max,
+            c_min: config.c_min,
+            p_samp: config.p_samp,
+            fanout: config.fanout.clone(),
+            metric: config.metric,
+        };
+
+        let indices: Vec<usize> = (0..npoints).collect();
+        let replica_start = Instant::now();
+        let mut replica_leaf_secs = 0.0f64;
+
+        partition::stream_partition_subtrees(
+            data,
+            ndims,
+            &indices,
+            &partition_config,
+            seed,
+            |leaves| {
+                total_leaves += leaves.len();
+
+                let t_leaf = Instant::now();
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let total_edges = AtomicUsize::new(0);
+
+                leaves.par_iter().for_each(|leaf| {
+                    let edges =
+                        leaf_build::build_leaf(data, ndims, &leaf.indices, config.k, config.metric);
+                    total_edges.fetch_add(edges.len(), Ordering::Relaxed);
+                    hash_prune.add_edges_batched(&edges);
+                });
+
+                total_edges_count += total_edges.load(Ordering::Relaxed);
+                replica_leaf_secs += t_leaf.elapsed().as_secs_f64();
+            },
+        );
+
+        let replica_total_secs = replica_start.elapsed().as_secs_f64();
+        partition_secs += (replica_total_secs - replica_leaf_secs).max(0.0);
+        leaf_build_secs += replica_leaf_secs;
+    }
+
+    (0..rayon::current_num_threads())
+        .into_par_iter()
+        .for_each(|_| {
+            leaf_build::release_thread_buffers();
+        });
+
+    let t3 = Instant::now();
+    let adjacency = hash_prune.extract_graph();
+    let extract_secs = t3.elapsed().as_secs_f64();
+    let final_prune_secs = 0.0;
+    let total_secs = t_total.elapsed().as_secs_f64();
+
+    let build_stats = PiPNNBuildStats {
+        total_secs,
+        sketch_secs,
+        partition_secs,
+        leaf_build_secs,
+        extract_secs,
+        final_prune_secs,
+        num_leaves: total_leaves,
+        total_edges: total_edges_count,
+    };
+
+    Ok(PiPNNGraph {
+        adjacency,
+        npoints,
+        ndims,
+        medoid,
+        metric: config.metric,
+        build_stats,
+    })
+}
+
+pub fn build_typed_sharded_scaffold<T: VectorRepr + Send + Sync>(
+    data: &[T],
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    memory_budget_bytes: usize,
+) -> PiPNNResult<PiPNNGraph> {
+    match choose_typed_build_plan::<T>(npoints, ndims, config, memory_budget_bytes) {
+        PiPNNBuildPlan::OneShot { .. } => build_internal(data, npoints, ndims, config, None),
+        PiPNNBuildPlan::NeedsSharded {
+            estimated_peak_bytes,
+        } => {
+            let estimated_streaming_peak_bytes =
+                estimate_typed_streaming_peak_memory_bytes::<T>(npoints, ndims, config);
+
+            if memory_budget_bytes < estimated_streaming_peak_bytes {
+                return Err(streaming_build_impossible_error(
+                    memory_budget_bytes,
+                    estimated_streaming_peak_bytes,
+                    estimated_peak_bytes,
+                ));
+            }
+
+            build_internal_streaming(data, npoints, ndims, config)
+        }
+    }
+}
+
+pub fn build_typed_with_memory_budget<T: VectorRepr + Send + Sync>(
+    data: &[T],
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    memory_budget_bytes: usize,
+) -> PiPNNResult<PiPNNGraph> {
+    build_typed_sharded_scaffold(data, npoints, ndims, config, memory_budget_bytes)
+}
+
 /// Build a PiPNN index from typed vector data.
 ///
 /// Keeps data in its native type T and converts to f32 on-the-fly at each access point,
@@ -890,7 +1161,9 @@ fn final_prune_from_candidates<T: VectorRepr + Send + Sync>(
                         let sel_pos = selected_idx[last_checked[i]];
                         last_checked[i] += 1;
 
-                        if sel_pos >= i { continue; }
+                        if sel_pos >= i {
+                            continue;
+                        }
 
                         let sel_id = candidates[sel_pos].0 as usize;
                         T::as_f32_into(&data[sel_id * ndims..(sel_id + 1) * ndims], &mut buf_sel)
@@ -1676,6 +1949,156 @@ mod tests {
     }
 
     #[test]
+    fn test_build_rejects_impossible_memory_budget() {
+        let npoints = 128;
+        let ndims = 16;
+        let data = generate_random_data(npoints, ndims, 42);
+        let config = PiPNNConfig {
+            c_max: 32,
+            c_min: 8,
+            k: 4,
+            max_degree: 16,
+            replicas: 1,
+            l_max: 32,
+            num_hash_planes: 8,
+            ..Default::default()
+        };
+
+        let result = build_typed_with_memory_budget(&data, npoints, ndims, &config, 1);
+        assert!(
+            result.is_err(),
+            "build should reject an impossible memory budget"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("memory budget"),
+            "unexpected error for impossible budget: {err}"
+        );
+    }
+
+    #[test]
+    fn test_choose_typed_build_plan_marks_streaming_when_over_budget() {
+        let npoints = 128;
+        let ndims = 16;
+        let config = PiPNNConfig {
+            c_max: 32,
+            c_min: 8,
+            k: 4,
+            max_degree: 16,
+            replicas: 1,
+            l_max: 32,
+            num_hash_planes: 8,
+            ..Default::default()
+        };
+
+        let decision = choose_typed_build_plan::<f32>(npoints, ndims, &config, 1);
+        match decision {
+            PiPNNBuildPlan::NeedsSharded {
+                estimated_peak_bytes,
+            } => {
+                assert!(estimated_peak_bytes > 1);
+            }
+            PiPNNBuildPlan::OneShot {
+                estimated_peak_bytes,
+            } => {
+                panic!(
+                    "expected streaming plan, got one-shot with estimate {estimated_peak_bytes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_choose_typed_build_plan_marks_one_shot_when_within_budget() {
+        let npoints = 64;
+        let ndims = 8;
+        let config = PiPNNConfig {
+            c_max: 32,
+            c_min: 8,
+            k: 4,
+            max_degree: 16,
+            replicas: 1,
+            l_max: 32,
+            num_hash_planes: 8,
+            ..Default::default()
+        };
+
+        let estimated = estimate_typed_peak_memory_bytes::<f32>(npoints, ndims, &config);
+        let decision = choose_typed_build_plan::<f32>(npoints, ndims, &config, estimated);
+        assert!(matches!(
+            decision,
+            PiPNNBuildPlan::OneShot {
+                estimated_peak_bytes
+            } if estimated_peak_bytes == estimated
+        ));
+    }
+
+    #[test]
+    fn test_build_typed_over_budget_path_rejects_budget_below_streaming_floor() {
+        let npoints = 128;
+        let ndims = 16;
+        let data = generate_random_data(npoints, ndims, 42);
+        let config = PiPNNConfig {
+            c_max: 32,
+            c_min: 8,
+            k: 4,
+            max_degree: 16,
+            replicas: 1,
+            l_max: 32,
+            num_hash_planes: 8,
+            ..Default::default()
+        };
+
+        let result = build_typed_sharded_scaffold(&data, npoints, ndims, &config, 1);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("streaming floor"));
+    }
+
+    #[test]
+    fn test_build_typed_with_memory_budget_streams_when_over_one_shot_budget() {
+        let npoints = 128;
+        let ndims = 16;
+        let data = generate_random_data(npoints, ndims, 42);
+        let config = PiPNNConfig {
+            c_max: 32,
+            c_min: 8,
+            k: 4,
+            max_degree: 16,
+            replicas: 1,
+            l_max: 32,
+            num_hash_planes: 8,
+            num_threads: 1,
+            final_prune: false,
+            ..Default::default()
+        };
+
+        let one_shot_graph = build_typed::<f32>(&data, npoints, ndims, &config)
+            .expect("one-shot build should succeed for the baseline comparison");
+        let estimated_one_shot = estimate_typed_peak_memory_bytes::<f32>(npoints, ndims, &config);
+        let streaming_budget = estimated_one_shot - (8 * 1024 * 1024);
+
+        assert!(
+            streaming_budget < estimated_one_shot,
+            "test precondition: streaming budget must be below one-shot estimate"
+        );
+
+        let result =
+            build_typed_with_memory_budget(&data, npoints, ndims, &config, streaming_budget);
+
+        assert!(
+            result.is_ok(),
+            "expected over-budget build to fall back to streaming RBC instead of erroring, got {result:?}"
+        );
+
+        let graph = result.unwrap();
+        assert_eq!(graph.npoints, npoints);
+        assert_eq!(graph.medoid, one_shot_graph.medoid);
+        assert!(graph.max_degree() <= config.max_degree);
+        assert!(graph.num_isolated() < npoints);
+    }
+
+    #[test]
     fn test_save_graph_single_node() {
         let graph = PiPNNGraph {
             adjacency: vec![vec![]],
@@ -1763,9 +2186,12 @@ mod tests {
             total_parsed_nodes += 1;
         }
         assert_eq!(
-            total_parsed_nodes, npoints + 1, // +1 for frozen start point
+            total_parsed_nodes,
+            npoints + 1, // +1 for frozen start point
             "expected to parse {} nodes ({}+1 frozen) but got {}",
-            npoints + 1, npoints, total_parsed_nodes
+            npoints + 1,
+            npoints,
+            total_parsed_nodes
         );
 
         std::fs::remove_dir_all(&dir).ok();
