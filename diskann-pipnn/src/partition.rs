@@ -737,6 +737,59 @@ fn compute_centroid_from_source<S: PointSource>(
     Ok(centroid)
 }
 
+/// Merge undersized clusters using pre-computed centroid sums.
+/// No file reads needed — centroids were accumulated during partition_assign.
+fn merge_small_with_precomputed_centroids(
+    mut clusters: Vec<Vec<usize>>,
+    centroid_sums: Vec<Vec<f32>>,
+    cluster_counts: Vec<usize>,
+    ndims: usize,
+    c_min: usize,
+) -> Vec<Vec<usize>> {
+    let mut large: Vec<(Vec<usize>, Vec<f32>)> = Vec::new();
+    let mut smalls: Vec<(Vec<usize>, Vec<f32>)> = Vec::new();
+
+    for (i, cluster) in clusters.drain(..).enumerate() {
+        if cluster.is_empty() {
+            continue;
+        }
+        let count = cluster_counts[i].max(1) as f32;
+        let centroid: Vec<f32> = centroid_sums[i].iter().map(|&v| v / count).collect();
+        if cluster.len() < c_min {
+            smalls.push((cluster, centroid));
+        } else {
+            large.push((cluster, centroid));
+        }
+    }
+
+    if smalls.is_empty() || large.is_empty() {
+        if large.is_empty() {
+            return smalls.into_iter().map(|(c, _)| c).collect();
+        }
+        return large.into_iter().map(|(c, _)| c).collect();
+    }
+
+    for (small, small_centroid) in smalls {
+        let nearest = large
+            .iter()
+            .enumerate()
+            .map(|(i, (_, lc))| {
+                let mut dist = 0.0f32;
+                for d in 0..ndims {
+                    let diff = small_centroid[d] - lc[d];
+                    dist += diff * diff;
+                }
+                (i, dist)
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        large[nearest].0.extend(small);
+    }
+
+    large.into_iter().map(|(c, _)| c).collect()
+}
+
 fn merge_small_into_nearest_from_source<S: PointSource>(
     source: &S,
     ndims: usize,
@@ -788,14 +841,22 @@ fn merge_small_into_nearest_from_source<S: PointSource>(
     Ok(large)
 }
 
-fn partition_assign_from_source<S: PointSource>(
+/// Chunked partition assignment from a PointSource.
+///
+/// Reads data in large sequential chunks, processes GEMM stripes in parallel
+/// within each chunk, and accumulates per-cluster centroid sums so the merge
+/// step doesn't need to re-read the data.
+///
+/// Returns (clusters, centroid_sums, cluster_counts) — centroids are sum/count.
+#[allow(clippy::disallowed_methods)]
+fn partition_assign_from_source<S: PointSource + Sync>(
     source: &S,
     ndims: usize,
     points: &[usize],
     leaders: &[usize],
     fanout: usize,
     metric: diskann_vector::distance::Metric,
-) -> PiPNNResult<Vec<Vec<usize>>> {
+) -> PiPNNResult<(Vec<Vec<usize>>, Vec<Vec<f32>>, Vec<usize>)> {
     let np = points.len();
     let nl = leaders.len();
     let num_assign = fanout.min(nl);
@@ -810,11 +871,7 @@ fn partition_assign_from_source<S: PointSource>(
             let mut norms = vec![0.0f32; nl];
             for i in 0..nl {
                 let row = &l_data[i * ndims..(i + 1) * ndims];
-                let mut norm = 0.0f32;
-                for &v in row {
-                    norm += v * v;
-                }
-                norms[i] = norm;
+                norms[i] = row.iter().map(|v| v * v).sum();
             }
             norms
         }
@@ -822,11 +879,7 @@ fn partition_assign_from_source<S: PointSource>(
             let mut norms = vec![0.0f32; nl];
             for i in 0..nl {
                 let row = &l_data[i * ndims..(i + 1) * ndims];
-                let mut norm = 0.0f32;
-                for &v in row {
-                    norm += v * v;
-                }
-                norms[i] = norm.sqrt();
+                norms[i] = row.iter().map(|v| v * v).sum::<f32>().sqrt();
             }
             norms
         }
@@ -835,100 +888,141 @@ fn partition_assign_from_source<S: PointSource>(
 
     let mut assignments = vec![0u32; np * num_assign];
     let stripe = ((16 * 1024 * 1024) / (nl.max(1) * std::mem::size_of::<f32>())).clamp(256, 16_384);
-    let mut p_data = vec![0.0f32; stripe * ndims];
-    let mut dots = vec![0.0f32; stripe * nl];
-    let mut buf: Vec<(u32, f32)> = Vec::with_capacity(nl);
+
+    // Read data in large chunks, process stripes in parallel within each chunk.
+    let chunk_size = (stripe * 4).min(np); // ~4 stripes per chunk
+    let mut chunk_buf = vec![0.0f32; chunk_size * ndims];
 
     let mut start = 0usize;
     while start < np {
-        let end = (start + stripe).min(np);
-        let sn = end - start;
-        let stripe_points = &points[start..end];
-        if stripe_points
+        let chunk_end = (start + chunk_size).min(np);
+        let cn = chunk_end - start;
+        let chunk_points = &points[start..chunk_end];
+
+        // One big sequential read for the whole chunk.
+        let is_contiguous = chunk_points
             .first()
-            .zip(stripe_points.last())
-            .is_some_and(|(&first, &last)| last + 1 - first == stripe_points.len())
-        {
-            source.copy_points_range_into(stripe_points[0], sn, &mut p_data[..sn * ndims])?;
+            .zip(chunk_points.last())
+            .is_some_and(|(&first, &last)| last + 1 - first == chunk_points.len());
+        if is_contiguous {
+            source.copy_points_range_into(chunk_points[0], cn, &mut chunk_buf[..cn * ndims])?;
         } else {
-            source.copy_points_into(stripe_points, &mut p_data[..sn * ndims])?;
+            source.copy_points_into(chunk_points, &mut chunk_buf[..cn * ndims])?;
         }
 
-        crate::gemm::sgemm_abt(
-            &p_data[..sn * ndims],
-            sn,
-            ndims,
-            &l_data,
-            nl,
-            &mut dots[..sn * nl],
-        );
+        // Parallel stripes within this chunk.
+        let chunk_data = &chunk_buf[..cn * ndims];
+        let chunk_assign = &mut assignments[start * num_assign..chunk_end * num_assign];
 
-        for i in 0..sn {
-            let dot_row = &dots[i * nl..(i + 1) * nl];
-            buf.clear();
-            match metric {
-                Metric::CosineNormalized => {
-                    for (j, &dot_val) in dot_row.iter().enumerate() {
-                        buf.push((j as u32, (1.0 - dot_val).max(0.0)));
+        chunk_assign
+            .par_chunks_mut(stripe * num_assign)
+            .enumerate()
+            .for_each(|(stripe_idx, assign_chunk)| {
+                let s = stripe_idx * stripe;
+                let e = (s + stripe).min(cn);
+                let sn = e - s;
+                let p_slice = &chunk_data[s * ndims..(s + sn) * ndims];
+
+                let mut dots = vec![0.0f32; sn * nl];
+                crate::gemm::sgemm_abt(p_slice, sn, ndims, &l_data, nl, &mut dots);
+
+                let mut buf: Vec<(u32, f32)> = Vec::with_capacity(nl);
+                for i in 0..sn {
+                    let dot_row = &dots[i * nl..(i + 1) * nl];
+                    buf.clear();
+                    match metric {
+                        Metric::CosineNormalized => {
+                            for (j, &d) in dot_row.iter().enumerate() {
+                                buf.push((j as u32, (1.0 - d).max(0.0)));
+                            }
+                        }
+                        Metric::Cosine => {
+                            let pi_sqrt: f32 = p_slice[i * ndims..(i + 1) * ndims]
+                                .iter().map(|v| v * v).sum::<f32>().sqrt();
+                            for (j, &d) in dot_row.iter().enumerate() {
+                                let denom = pi_sqrt * l_norms[j];
+                                let cos_sim = if denom > 0.0 { d / denom } else { 0.0 };
+                                buf.push((j as u32, (1.0 - cos_sim).max(0.0)));
+                            }
+                        }
+                        Metric::L2 => {
+                            let pi: f32 = p_slice[i * ndims..(i + 1) * ndims]
+                                .iter().map(|v| v * v).sum();
+                            for (j, &d) in dot_row.iter().enumerate() {
+                                buf.push((j as u32, (pi + l_norms[j] - 2.0 * d).max(0.0)));
+                            }
+                        }
+                        Metric::InnerProduct => {
+                            for (j, &d) in dot_row.iter().enumerate() {
+                                buf.push((j as u32, -d));
+                            }
+                        }
+                    }
+
+                    if num_assign > 0 && num_assign < buf.len() {
+                        buf.select_nth_unstable_by(num_assign - 1, |a, b| {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                    let out = &mut assign_chunk[i * num_assign..(i + 1) * num_assign];
+                    for k in 0..num_assign {
+                        out[k] = buf[k].0;
                     }
                 }
-                Metric::Cosine => {
-                    let mut pi = 0.0f32;
-                    let row = &p_data[i * ndims..(i + 1) * ndims];
-                    for &v in row {
-                        pi += v * v;
-                    }
-                    let pi_sqrt = pi.sqrt();
-                    for (j, &dot_val) in dot_row.iter().enumerate() {
-                        let denom = pi_sqrt * l_norms[j];
-                        let cos_sim = if denom > 0.0 { dot_val / denom } else { 0.0 };
-                        buf.push((j as u32, (1.0 - cos_sim).max(0.0)));
-                    }
-                }
-                Metric::L2 => {
-                    let mut pi = 0.0f32;
-                    let row = &p_data[i * ndims..(i + 1) * ndims];
-                    for &v in row {
-                        pi += v * v;
-                    }
-                    for (j, &dot_val) in dot_row.iter().enumerate() {
-                        let d = (pi + l_norms[j] - 2.0 * dot_val).max(0.0);
-                        buf.push((j as u32, d));
-                    }
-                }
-                Metric::InnerProduct => {
-                    for (j, &dot_val) in dot_row.iter().enumerate() {
-                        buf.push((j as u32, -dot_val));
-                    }
-                }
-            }
+            });
 
-            if num_assign > 0 && num_assign < buf.len() {
-                buf.select_nth_unstable_by(num_assign - 1, |a, b| {
-                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-
-            let out = &mut assignments[(start + i) * num_assign..(start + i + 1) * num_assign];
-            for k in 0..num_assign {
-                out[k] = buf[k].0;
-            }
-        }
-
-        start = end;
+        start = chunk_end;
     }
 
+    // Build clusters + accumulate centroid sums in one pass.
     let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); nl];
+    let mut centroid_sums: Vec<Vec<f32>> = (0..nl).map(|_| vec![0.0f32; ndims]).collect();
+    let mut cluster_counts: Vec<usize> = vec![0; nl];
+
+    // Build a point→cluster mapping for centroid accumulation.
     for i in 0..np {
         let row = &assignments[i * num_assign..(i + 1) * num_assign];
         for &li in row {
             clusters[li as usize].push(i);
         }
     }
-    Ok(clusters)
+
+    // Accumulate centroids by re-reading data in chunks (same sequential I/O).
+    start = 0;
+    while start < np {
+        let chunk_end = (start + chunk_size).min(np);
+        let cn = chunk_end - start;
+        let chunk_points = &points[start..chunk_end];
+
+        let is_contiguous = chunk_points
+            .first()
+            .zip(chunk_points.last())
+            .is_some_and(|(&first, &last)| last + 1 - first == chunk_points.len());
+        if is_contiguous {
+            source.copy_points_range_into(chunk_points[0], cn, &mut chunk_buf[..cn * ndims])?;
+        } else {
+            source.copy_points_into(chunk_points, &mut chunk_buf[..cn * ndims])?;
+        }
+
+        for i in 0..cn {
+            let row = &assignments[(start + i) * num_assign..(start + i + 1) * num_assign];
+            let vec_data = &chunk_buf[i * ndims..(i + 1) * ndims];
+            for &li in row {
+                let cs = &mut centroid_sums[li as usize];
+                for d in 0..ndims {
+                    cs[d] += vec_data[d];
+                }
+                cluster_counts[li as usize] += 1;
+            }
+        }
+
+        start = chunk_end;
+    }
+
+    Ok((clusters, centroid_sums, cluster_counts))
 }
 
-fn partition_from_source<S: PointSource>(
+fn partition_from_source<S: PointSource + Sync>(
     source: &S,
     ndims: usize,
     indices: &[usize],
@@ -953,15 +1047,16 @@ fn partition_from_source<S: PointSource>(
     };
     let num_leaders = sample_num_leaders(n, config.p_samp);
     let leaders: Vec<usize> = indices.choose_multiple(rng, num_leaders).copied().collect();
-    let clusters_local =
+    let (clusters_local, centroid_sums, cluster_counts) =
         partition_assign_from_source(source, ndims, indices, &leaders, fanout, config.metric)?;
     let clusters: Vec<Vec<usize>> = clusters_local
         .into_iter()
         .map(|local_cluster| local_cluster.into_iter().map(|li| indices[li]).collect())
         .collect();
 
-    let merged_clusters =
-        merge_small_into_nearest_from_source(source, ndims, clusters, config.c_min)?;
+    let merged_clusters = merge_small_with_precomputed_centroids(
+        clusters, centroid_sums, cluster_counts, ndims, config.c_min,
+    );
     if merged_clusters.len() == 1 && merged_clusters[0].len() > config.c_max {
         return Ok(force_split(&merged_clusters[0], config.c_max));
     }
@@ -982,7 +1077,7 @@ fn partition_from_source<S: PointSource>(
     Ok(leaves)
 }
 
-pub(crate) fn stream_partition_subtrees_from_source<S: PointSource, F>(
+pub(crate) fn stream_partition_subtrees_from_source<S: PointSource + Sync, F>(
     source: &S,
     ndims: usize,
     indices: &[usize],
@@ -1012,30 +1107,40 @@ where
         .copied()
         .collect();
 
-    let clusters_local =
+    let (clusters_local, centroid_sums, cluster_counts) =
         partition_assign_from_source(source, ndims, indices, &leaders, fanout, config.metric)?;
     let clusters: Vec<Vec<usize>> = clusters_local
         .into_iter()
         .map(|local_cluster| local_cluster.into_iter().map(|li| indices[li]).collect())
         .collect();
-    let merged_clusters =
-        merge_small_into_nearest_from_source(source, ndims, clusters, config.c_min)?;
+
+    // Merge using pre-computed centroids (no file re-reads).
+    let merged_clusters = merge_small_with_precomputed_centroids(
+        clusters,
+        centroid_sums,
+        cluster_counts,
+        ndims,
+        config.c_min,
+    );
     let sub_seeds: Vec<u64> = (0..merged_clusters.len()).map(|_| rng.random()).collect();
 
-    for (cluster, sub_seed) in merged_clusters.into_iter().zip(sub_seeds.into_iter()) {
-        if cluster.len() <= config.c_max {
-            emit(vec![Leaf { indices: cluster }])?;
-        } else {
-            let mut sub_rng = rand::rngs::StdRng::seed_from_u64(sub_seed);
-            emit(partition_from_source(
-                source,
-                ndims,
-                &cluster,
-                config,
-                1,
-                &mut sub_rng,
-            )?)?;
-        }
+    // Parallel recursive partition on oversized clusters.
+    // Sub-clusters are small so file reads per sub-cluster are cheap.
+    let recursive_results: Vec<PiPNNResult<Vec<Leaf>>> = merged_clusters
+        .par_iter()
+        .zip(sub_seeds.par_iter())
+        .map(|(cluster, sub_seed)| {
+            if cluster.len() <= config.c_max {
+                Ok(vec![Leaf { indices: cluster.clone() }])
+            } else {
+                let mut sub_rng = rand::rngs::StdRng::seed_from_u64(*sub_seed);
+                partition_from_source(source, ndims, cluster, config, 1, &mut sub_rng)
+            }
+        })
+        .collect();
+
+    for result in recursive_results {
+        emit(result?)?;
     }
 
     Ok(())
@@ -1779,7 +1884,7 @@ mod tests {
             partition_assign_from_source(&source, ndims, &points, &leaders, fanout, Metric::L2)
                 .unwrap();
 
-        assert_eq!(expected, actual);
+        assert_eq!(expected, actual.0);
         assert_eq!(
             source.gather_calls.load(Ordering::Relaxed),
             1,
@@ -1807,7 +1912,7 @@ mod tests {
             partition_assign_from_source(&source, ndims, &points, &leaders, fanout, Metric::L2)
                 .unwrap();
 
-        assert_eq!(expected, actual);
+        assert_eq!(expected, actual.0);
         assert_eq!(
             source.range_calls.load(Ordering::Relaxed),
             0,
