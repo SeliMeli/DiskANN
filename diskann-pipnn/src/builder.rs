@@ -945,32 +945,28 @@ use crate::hash_prune::LshSketchesBuilder;
 /// Sharded PiPNN build for datasets larger than RAM.
 ///
 /// Phases:
-///   0. Stream data shard-by-shard to compute LSH sketches + medoid
-///   1. Per-shard partition → leaf build → edges to global HashPrune
-///   2. Extract graph from HashPrune
+///   0. Stream data in chunks to compute LSH sketches (only phase that needs chunking)
+///   1. Global partition → leaf build → HashPrune (using mmap'd full dataset)
+///   2. Extract graph
 ///
-/// Only one shard of data is in memory at any time. The fixed-size structures
-/// (HashPrune reservoirs, LSH sketches) span all N points and stay resident.
+/// The `full_data` source (typically MmapDataSource) covers all N points. The OS
+/// pages in only the active working set: partition processes in GEMM stripes (~16 MB),
+/// leaf build touches c_max vectors at a time. Peak data RSS ≈ stripe + leaf, not N.
 ///
-/// `shard_ranges[i] = (global_offset, shard_npoints)` — non-overlapping,
-/// covering all `npoints`. `shard_factory(i)` returns a data source for shard `i`.
-pub fn build_sharded<S: VectorDataSource>(
+/// `shard_ranges` + `shard_factory` are only used for Phase 0 sketch computation.
+pub fn build_sharded<S, D>(
     npoints: usize,
     ndims: usize,
     config: &PiPNNConfig,
     shard_ranges: &[(usize, usize)],
     shard_factory: impl Fn(usize) -> S + Send + Sync,
-) -> PiPNNResult<PiPNNGraph> {
+    full_data: &D,
+) -> PiPNNResult<PiPNNGraph>
+where
+    S: VectorDataSource,
+    D: VectorDataSource + Sync,
+{
     config.validate()?;
-
-    // Validate shard ranges cover exactly npoints.
-    let total: usize = shard_ranges.iter().map(|&(_, n)| n).sum();
-    if total != npoints {
-        return Err(PiPNNError::Config(format!(
-            "shard_ranges cover {} points but npoints={}",
-            total, npoints
-        )));
-    }
 
     if config.num_threads > 0 {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -978,65 +974,45 @@ pub fn build_sharded<S: VectorDataSource>(
             .build()
             .map_err(|e| PiPNNError::Config(format!("Failed to create thread pool: {}", e)))?;
         return pool.install(|| {
-            build_sharded_impl(npoints, ndims, config, shard_ranges, &shard_factory)
+            build_sharded_impl(npoints, ndims, config, shard_ranges, &shard_factory, full_data)
         });
     }
-    build_sharded_impl(npoints, ndims, config, shard_ranges, &shard_factory)
+    build_sharded_impl(npoints, ndims, config, shard_ranges, &shard_factory, full_data)
 }
 
 #[allow(clippy::disallowed_methods)]
-fn build_sharded_impl<S: VectorDataSource>(
+fn build_sharded_impl<S, D>(
     npoints: usize,
     ndims: usize,
     config: &PiPNNConfig,
     shard_ranges: &[(usize, usize)],
     shard_factory: &(impl Fn(usize) -> S + Send + Sync),
-) -> PiPNNResult<PiPNNGraph> {
+    full_data: &D,
+) -> PiPNNResult<PiPNNGraph>
+where
+    S: VectorDataSource,
+    D: VectorDataSource + Sync,
+{
     let t_total = Instant::now();
 
-    // ── Phase 0: Stream shards to compute LSH sketches + centroid ──
+    // ── Phase 0: Stream chunks to compute LSH sketches ──
     let t0 = Instant::now();
     let mut sketch_builder = LshSketchesBuilder::new(npoints, ndims, config.num_hash_planes, 42);
-    let mut centroid = vec![0.0f32; ndims];
-    let mut point_buf = vec![0.0f32; ndims];
-
-    for (shard_id, &(offset, shard_n)) in shard_ranges.iter().enumerate() {
+    for (shard_id, &(offset, _)) in shard_ranges.iter().enumerate() {
         let shard = shard_factory(shard_id);
         sketch_builder.fill_shard_from_source(&shard, offset);
-        // Accumulate centroid.
-        for i in 0..shard_n {
-            S::Elem::as_f32_into(shard.get(i), &mut point_buf).expect("f32 conversion");
-            for d in 0..ndims {
-                centroid[d] += point_buf[d];
-            }
-        }
-    }
-    let inv_n = 1.0 / npoints as f32;
-    for c in &mut centroid {
-        *c *= inv_n;
     }
     let sketches = sketch_builder.finish();
     let sketch_secs = t0.elapsed().as_secs_f64();
-    tracing::info!(elapsed_secs = sketch_secs, "Phase 0: sketches + centroid complete");
 
-    // Find medoid (second pass: closest point to centroid).
-    let dist_fn = make_dist_fn(Metric::L2);
-    let mut medoid = 0usize;
-    let mut best_dist = f32::MAX;
-    for (shard_id, &(offset, shard_n)) in shard_ranges.iter().enumerate() {
-        let shard = shard_factory(shard_id);
-        for i in 0..shard_n {
-            S::Elem::as_f32_into(shard.get(i), &mut point_buf).expect("f32 conversion");
-            let d = dist_fn.call(&point_buf, &centroid);
-            if d < best_dist {
-                best_dist = d;
-                medoid = offset + i;
-            }
-        }
-    }
-    tracing::info!(medoid = medoid, "Medoid found");
+    // Find medoid using the full mmap'd data source.
+    let medoid = find_medoid_from_source(full_data);
+    tracing::info!(sketch_secs = sketch_secs, medoid = medoid, "Phase 0 complete");
 
-    // ── Phase 1: Per-shard partition → leaf build → global HashPrune ──
+    // ── Phase 1: Global partition → leaf build → HashPrune ──
+    // Same logic as one-shot build, but data comes from mmap (full_data).
+    // partition_assign already processes in GEMM stripes (~16 MB each),
+    // leaf build touches c_max vectors per leaf. Peak data RSS is bounded.
     let hash_prune = HashPrune::from_sketches(sketches, npoints, config.l_max, config.max_degree);
     let mut partition_secs = 0.0f64;
     let mut leaf_build_secs = 0.0f64;
@@ -1045,54 +1021,39 @@ fn build_sharded_impl<S: VectorDataSource>(
 
     for replica in 0..config.replicas {
         let seed = 1000 + replica as u64 * 7919;
+        let partition_config = PartitionConfig {
+            c_max: config.c_max,
+            c_min: config.c_min,
+            p_samp: config.p_samp,
+            fanout: config.fanout.clone(),
+            metric: config.metric,
+        };
+        let indices: Vec<usize> = (0..npoints).collect();
 
-        for (shard_id, &(offset, shard_n)) in shard_ranges.iter().enumerate() {
-            let shard = shard_factory(shard_id);
-            let partition_config = PartitionConfig {
-                c_max: config.c_max,
-                c_min: config.c_min,
-                p_samp: config.p_samp,
-                fanout: config.fanout.clone(),
-                metric: config.metric,
-            };
-            let shard_seed = seed.wrapping_add(shard_id as u64 * 31);
-            let indices: Vec<usize> = (0..shard_n).collect();
+        let t1 = Instant::now();
+        let leaves = partition::parallel_partition(full_data, &indices, &partition_config, seed);
+        partition_secs += t1.elapsed().as_secs_f64();
+        total_leaves += leaves.len();
 
-            let t1 = Instant::now();
-            let leaves = partition::parallel_partition(&shard, &indices, &partition_config, shard_seed);
-            partition_secs += t1.elapsed().as_secs_f64();
-            total_leaves += leaves.len();
+        let t2 = Instant::now();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let replica_edges = AtomicUsize::new(0);
 
-            let t2 = Instant::now();
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            let shard_edges = AtomicUsize::new(0);
+        leaves.par_iter().for_each(|leaf| {
+            let edges = leaf_build::build_leaf(full_data, &leaf.indices, config.k, config.metric);
+            replica_edges.fetch_add(edges.len(), Ordering::Relaxed);
+            hash_prune.add_edges_batched(&edges);
+        });
+        leaf_build_secs += t2.elapsed().as_secs_f64();
+        total_edges_count += replica_edges.load(Ordering::Relaxed);
 
-            leaves.par_iter().for_each(|leaf| {
-                let edges = leaf_build::build_leaf(&shard, &leaf.indices, config.k, config.metric);
-                // Translate shard-local indices to global.
-                let global_edges: Vec<leaf_build::Edge> = edges
-                    .iter()
-                    .map(|e| leaf_build::Edge {
-                        src: e.src + offset,
-                        dst: e.dst + offset,
-                        distance: e.distance,
-                    })
-                    .collect();
-                shard_edges.fetch_add(global_edges.len(), Ordering::Relaxed);
-                hash_prune.add_edges_batched(&global_edges);
-            });
-            leaf_build_secs += t2.elapsed().as_secs_f64();
-            total_edges_count += shard_edges.load(Ordering::Relaxed);
-
-            tracing::debug!(
-                replica = replica,
-                shard_id = shard_id,
-                offset = offset,
-                shard_n = shard_n,
-                leaves = leaves.len(),
-                "Shard complete"
-            );
-        }
+        tracing::info!(
+            replica = replica,
+            partition_secs = t1.elapsed().as_secs_f64(),
+            leaves = leaves.len(),
+            edges = replica_edges.load(Ordering::Relaxed),
+            "Replica complete"
+        );
     }
 
     // Release thread-local leaf buffers.
@@ -1102,18 +1063,9 @@ fn build_sharded_impl<S: VectorDataSource>(
             leaf_build::release_thread_buffers();
         });
 
-    tracing::info!(
-        partition_secs = partition_secs,
-        leaf_build_secs = leaf_build_secs,
-        total_leaves = total_leaves,
-        total_edges = total_edges_count,
-        "Phase 1 complete"
-    );
-
     // ── Phase 2: Extract graph ──
-    // TODO: Support final_prune in sharded builds. Currently skipped because
-    // final_prune_from_candidates needs all data in memory for inter-candidate
-    // distance computation. A sharded final_prune would need to stream data again.
+    // TODO: Support final_prune in sharded builds (needs mmap'd data for
+    // inter-candidate distance computation).
     if config.final_prune {
         tracing::warn!("final_prune is not yet supported in sharded builds, ignoring");
     }
@@ -1151,6 +1103,38 @@ fn build_sharded_impl<S: VectorDataSource>(
     );
 
     Ok(graph)
+}
+
+/// Find medoid from a VectorDataSource (mmap-friendly).
+fn find_medoid_from_source<D: VectorDataSource>(data: &D) -> usize {
+    let npoints = data.npoints();
+    let ndims = data.ndims();
+    let dist_fn = make_dist_fn(Metric::L2);
+
+    let mut centroid = vec![0.0f32; ndims];
+    let mut point_buf = vec![0.0f32; ndims];
+    for i in 0..npoints {
+        D::Elem::as_f32_into(data.get(i), &mut point_buf).expect("f32 conversion");
+        for d in 0..ndims {
+            centroid[d] += point_buf[d];
+        }
+    }
+    let inv = 1.0 / npoints as f32;
+    for c in &mut centroid {
+        *c *= inv;
+    }
+
+    let mut best = 0;
+    let mut best_dist = f32::MAX;
+    for i in 0..npoints {
+        D::Elem::as_f32_into(data.get(i), &mut point_buf).expect("f32 conversion");
+        let d = dist_fn.call(&point_buf, &centroid);
+        if d < best_dist {
+            best_dist = d;
+            best = i;
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -2375,6 +2359,7 @@ mod tests {
             .map(|i| (i * shard_size, shard_size))
             .collect();
 
+        let full_src = crate::data_source::SliceDataSource::new(&data, npoints, ndims);
         let graph = build_sharded(
             npoints,
             ndims,
@@ -2388,6 +2373,7 @@ mod tests {
                     ndims,
                 )
             },
+            &full_src,
         )
         .unwrap();
 
@@ -2439,6 +2425,7 @@ mod tests {
         let shard_ranges: Vec<(usize, usize)> = (0..3)
             .map(|i| (i * shard_size, shard_size))
             .collect();
+        let full_src = crate::data_source::SliceDataSource::new(&data, npoints, ndims);
         let graph_sharded = build_sharded(
             npoints,
             ndims,
@@ -2452,6 +2439,7 @@ mod tests {
                     ndims,
                 )
             },
+            &full_src,
         )
         .unwrap();
 

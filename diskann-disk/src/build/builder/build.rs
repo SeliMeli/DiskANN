@@ -536,6 +536,12 @@ where
                     );
 
                     let data_path_owned = data_path.clone();
+                    // Full-file mmap for global partition + leaf build.
+                    let full_mmap = diskann_pipnn::data_source::MmapDataSource::<Data::VectorDataType>::open_full(
+                        std::path::Path::new(&data_path),
+                    )
+                    .map_err(|e| ANNError::log_index_error(format!("mmap open failed: {}", e)))?;
+
                     builder::build_sharded(
                         npoints,
                         ndims,
@@ -550,6 +556,7 @@ where
                             )
                             .expect("mmap shard open")
                         },
+                        &full_mmap,
                     )
                     .map_err(|e| ANNError::log_index_error(format!("PiPNN sharded build failed: {}", e)))?
                 } else {
