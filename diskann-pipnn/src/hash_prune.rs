@@ -32,37 +32,46 @@ pub struct LshSketches {
     npoints: usize,
 }
 
-impl LshSketches {
-    /// Create new LSH sketches for the given data using parallel dot products.
-    ///
-    /// `data` is row-major: npoints x ndims.
-    pub fn new<T: VectorRepr + Send + Sync>(
-        data: &[T],
-        npoints: usize,
-        ndims: usize,
-        num_planes: usize,
-        seed: u64,
-    ) -> Self {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+/// Incremental builder for LSH sketches — compute shard by shard.
+///
+/// Use when the full dataset doesn't fit in memory. Call `fill_shard` or
+/// `fill_shard_quantized` for each data shard, then `finish()`.
+pub struct LshSketchesBuilder {
+    hyperplanes: Vec<f32>,
+    sketches: Vec<f32>,
+    num_planes: usize,
+    ndims: usize,
+    npoints: usize,
+}
 
-        // Generate random hyperplanes from standard normal distribution.
-        // Stored as num_planes x ndims (row-major).
+impl LshSketchesBuilder {
+    /// Create a builder with pre-generated hyperplanes and pre-allocated sketch buffer.
+    pub fn new(npoints: usize, ndims: usize, num_planes: usize, seed: u64) -> Self {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let hyperplanes: Vec<f32> = (0..num_planes * ndims)
             .map(|_| StandardNormal.sample(&mut rng))
             .collect();
+        let sketches = vec![0.0f32; npoints * num_planes];
+        Self { hyperplanes, sketches, num_planes, ndims, npoints }
+    }
 
-        // Compute sketches in parallel using direct dot products.
-        // For tall-thin output (npoints x 12), this is faster than GEMM.
-        let mut sketches = vec![0.0f32; npoints * num_planes];
+    /// Compute sketches for points [global_offset..global_offset+shard_npoints).
+    /// `data` is row-major: shard_npoints × ndims.
+    /// Can be called multiple times for non-overlapping shard ranges.
+    #[allow(clippy::disallowed_methods)]
+    pub fn fill_shard<T: VectorRepr + Send + Sync>(
+        &mut self, data: &[T], global_offset: usize, shard_npoints: usize,
+    ) {
+        debug_assert!(global_offset + shard_npoints <= self.npoints);
+        let ndims = self.ndims;
+        let num_planes = self.num_planes;
+        let hyperplanes = &self.hyperplanes;
 
-        // Allow: callers (`build_internal`, `build_internal_sq`) wrap this in
-        // `pool.install(|| ...)`, so parallel work already runs on the correct pool.
-        #[allow(clippy::disallowed_methods)]
-        sketches
+        let shard_sketches = &mut self.sketches[global_offset * num_planes..(global_offset + shard_npoints) * num_planes];
+        shard_sketches
             .par_chunks_mut(num_planes)
             .enumerate()
             .for_each(|(i, sketch_row)| {
-                // Thread-local buffer for T -> f32 conversion.
                 thread_local! {
                     static SKETCH_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
                 }
@@ -75,47 +84,27 @@ impl LshSketches {
                         let plane = &hyperplanes[j * ndims..(j + 1) * ndims];
                         let mut dot = 0.0f32;
                         for d in 0..ndims {
-                            // SAFETY: `d` is in 0..ndims, buf.len() == ndims (from resize above),
-                            // and plane.len() == ndims (sliced from hyperplanes). Both accesses
-                            // are within bounds.
-                            unsafe {
-                                dot += *buf.get_unchecked(d) * *plane.get_unchecked(d);
-                            }
+                            unsafe { dot += *buf.get_unchecked(d) * *plane.get_unchecked(d); }
                         }
                         sketch_row[j] = dot;
                     }
                 });
             });
-
-        Self {
-            num_planes,
-            sketches,
-            npoints,
-        }
     }
 
-    /// Create LSH sketches from 1-bit quantized data.
-    ///
-    /// Computes dot(1bit_vec, hyperplane) = sum of hyperplane[d] where bit d is set.
-    /// No f16/f32 data needed — works directly on the QuantizedData bit vectors.
-    pub fn new_from_quantized(
-        qdata: &crate::quantize::QuantizedData,
-        npoints: usize,
-        ndims: usize,
-        num_planes: usize,
-        seed: u64,
-    ) -> Self {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let hyperplanes: Vec<f32> = (0..num_planes * ndims)
-            .map(|_| StandardNormal.sample(&mut rng))
-            .collect();
+    /// Compute sketches from 1-bit quantized data for points [global_offset..+shard_npoints).
+    #[allow(clippy::disallowed_methods)]
+    pub fn fill_shard_quantized(
+        &mut self, qdata: &crate::quantize::QuantizedData,
+        global_offset: usize, shard_npoints: usize,
+    ) {
+        debug_assert!(global_offset + shard_npoints <= self.npoints);
+        let ndims = self.ndims;
+        let num_planes = self.num_planes;
+        let hyperplanes = &self.hyperplanes;
 
-        let mut sketches = vec![0.0f32; npoints * num_planes];
-
-        // Allow: callers (`build_internal`, `build_internal_sq`) wrap this in
-        // `pool.install(|| ...)`, so parallel work already runs on the correct pool.
-        #[allow(clippy::disallowed_methods)]
-        sketches
+        let shard_sketches = &mut self.sketches[global_offset * num_planes..(global_offset + shard_npoints) * num_planes];
+        shard_sketches
             .par_chunks_mut(num_planes)
             .enumerate()
             .for_each(|(i, sketch_row)| {
@@ -123,25 +112,42 @@ impl LshSketches {
                 for j in 0..num_planes {
                     let plane = &hyperplanes[j * ndims..(j + 1) * ndims];
                     let mut dot = 0.0f32;
-                    // Iterate set bits: for each byte, check each bit.
                     for d in 0..ndims {
                         if bits[d / 8] & (1 << (d % 8)) != 0 {
-                            // SAFETY: `d` is in 0..ndims and plane.len() == ndims
-                            // (sliced from hyperplanes), so the access is within bounds.
-                            unsafe {
-                                dot += *plane.get_unchecked(d);
-                            }
+                            unsafe { dot += *plane.get_unchecked(d); }
                         }
                     }
                     sketch_row[j] = dot;
                 }
             });
+    }
 
-        Self {
-            num_planes,
-            sketches,
-            npoints,
-        }
+    /// Consume the builder into an LshSketches.
+    pub fn finish(self) -> LshSketches {
+        LshSketches { num_planes: self.num_planes, sketches: self.sketches, npoints: self.npoints }
+    }
+}
+
+impl LshSketches {
+    /// Create new LSH sketches for the given data using parallel dot products.
+    /// Convenience wrapper around LshSketchesBuilder for one-shot builds.
+    pub fn new<T: VectorRepr + Send + Sync>(
+        data: &[T], npoints: usize, ndims: usize, num_planes: usize, seed: u64,
+    ) -> Self {
+        let mut builder = LshSketchesBuilder::new(npoints, ndims, num_planes, seed);
+        builder.fill_shard(data, 0, npoints);
+        builder.finish()
+    }
+
+    /// Create LSH sketches from 1-bit quantized data.
+    /// Convenience wrapper around LshSketchesBuilder for one-shot builds.
+    pub fn new_from_quantized(
+        qdata: &crate::quantize::QuantizedData,
+        npoints: usize, ndims: usize, num_planes: usize, seed: u64,
+    ) -> Self {
+        let mut builder = LshSketchesBuilder::new(npoints, ndims, num_planes, seed);
+        builder.fill_shard_quantized(qdata, 0, npoints);
+        builder.finish()
     }
 
     /// Compute the hash of candidate c relative to point p.
