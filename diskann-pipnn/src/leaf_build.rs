@@ -18,6 +18,8 @@ use diskann::utils::VectorRepr;
 use diskann_vector::distance::SquaredL2;
 use diskann_vector::PureDistanceFunction;
 
+use crate::data_source::VectorDataSource;
+
 /// Thread-local reusable buffers for leaf building.
 /// Avoids repeated allocation/deallocation of large matrices.
 pub struct LeafBuffers {
@@ -172,9 +174,8 @@ fn extract_knn(dist_matrix: &[f32], n: usize, k: usize) -> Vec<(usize, usize, f3
 /// Build a leaf partition: compute all-pairs distances and extract bi-directed k-NN edges.
 ///
 /// Returns edges as (global_src, global_dst, distance).
-pub fn build_leaf<T: VectorRepr>(
-    data: &[T],
-    ndims: usize,
+pub fn build_leaf<D: VectorDataSource>(
+    data: &D,
     indices: &[usize],
     k: usize,
     metric: diskann_vector::distance::Metric,
@@ -186,27 +187,27 @@ pub fn build_leaf<T: VectorRepr>(
 
     LEAF_BUFFERS.with(|cell| {
         let mut bufs = cell.borrow_mut();
-        build_leaf_with_buffers(data, ndims, indices, k, metric, &mut bufs)
+        build_leaf_with_buffers(data, indices, k, metric, &mut bufs)
     })
 }
 
-fn build_leaf_with_buffers<T: VectorRepr>(
-    data: &[T],
-    ndims: usize,
+fn build_leaf_with_buffers<D: VectorDataSource>(
+    data: &D,
     indices: &[usize],
     k: usize,
     metric: diskann_vector::distance::Metric,
     bufs: &mut LeafBuffers,
 ) -> Vec<Edge> {
     let n = indices.len();
+    let ndims = data.ndims();
     bufs.ensure_capacity(n, ndims);
 
     // Extract local data into reused buffer, converting T -> f32 on the fly.
     let local_data = &mut bufs.local_data[..n * ndims];
     for (i, &idx) in indices.iter().enumerate() {
-        let src = &data[idx * ndims..(idx + 1) * ndims];
+        let src = data.get(idx);
         let dst = &mut local_data[i * ndims..(i + 1) * ndims];
-        T::as_f32_into(src, dst).expect("f32 conversion");
+        D::Elem::as_f32_into(src, dst).expect("f32 conversion");
     }
 
     // Compute norms into reused buffer.
@@ -430,6 +431,7 @@ pub fn brute_force_knn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_source::SliceDataSource;
     use diskann_vector::distance::{DistanceProvider, Metric};
 
     #[test]
@@ -472,9 +474,10 @@ mod tests {
             0.0, 1.0, // point 2
             1.0, 1.0, // point 3
         ];
+        let src = SliceDataSource::new(&data, 4, 2);
         let indices = vec![0, 1, 2, 3];
 
-        let edges = build_leaf(&data, 2, &indices, 2, Metric::L2);
+        let edges = build_leaf(&src, &indices, 2, Metric::L2);
 
         assert!(!edges.is_empty());
 
@@ -537,8 +540,9 @@ mod tests {
             }
         }
 
+        let src = SliceDataSource::new(&data, 4, 2);
         let indices = vec![0, 1, 2, 3];
-        let edges = build_leaf(&data, 2, &indices, 2, Metric::CosineNormalized);
+        let edges = build_leaf(&src, &indices, 2, Metric::CosineNormalized);
 
         assert!(!edges.is_empty(), "cosine leaf should produce edges");
 
@@ -588,8 +592,9 @@ mod tests {
     fn test_build_leaf_single_point() {
         // A leaf with 1 point should produce no edges.
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let src = SliceDataSource::new(&data, 1, 4);
         let indices = vec![0];
-        let edges = build_leaf(&data, 4, &indices, 3, Metric::L2);
+        let edges = build_leaf(&src, &indices, 3, Metric::L2);
         assert!(
             edges.is_empty(),
             "single point leaf should produce 0 edges, got {}",
@@ -601,8 +606,9 @@ mod tests {
     fn test_build_leaf_two_points() {
         // A leaf with 2 points should produce bidirectional edges.
         let data = vec![0.0f32, 0.0, 1.0, 0.0];
+        let src = SliceDataSource::new(&data, 2, 2);
         let indices = vec![0, 1];
-        let edges = build_leaf(&data, 2, &indices, 3, Metric::L2);
+        let edges = build_leaf(&src, &indices, 3, Metric::L2);
         assert!(!edges.is_empty(), "two point leaf should produce edges");
 
         // Should have both directions: 0->1 and 1->0.
@@ -616,10 +622,11 @@ mod tests {
     fn test_build_leaf_k_equals_n() {
         // k >= n, every point should connect to every other.
         let data = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let src = SliceDataSource::new(&data, 4, 2);
         let indices = vec![0, 1, 2, 3];
         let n = indices.len();
         // k = n means each point gets n-1 nearest neighbors = all others.
-        let edges = build_leaf(&data, 2, &indices, n, Metric::L2);
+        let edges = build_leaf(&src, &indices, n, Metric::L2);
 
         // Collect directed edges.
         let edge_set: std::collections::HashSet<(usize, usize)> =
@@ -644,10 +651,11 @@ mod tests {
     fn test_build_leaf_with_buffers_reuse() {
         // Call build_leaf_with_buffers twice and verify buffers are reused.
         let data = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let src = SliceDataSource::new(&data, 4, 2);
         let indices = vec![0, 1, 2, 3];
         let mut bufs = LeafBuffers::new();
 
-        let edges1 = build_leaf_with_buffers(&data, 2, &indices, 2, Metric::L2, &mut bufs);
+        let edges1 = build_leaf_with_buffers(&src, &indices, 2, Metric::L2, &mut bufs);
         assert!(!edges1.is_empty(), "first call should produce edges");
 
         // Verify buffers are allocated.
@@ -657,7 +665,7 @@ mod tests {
         );
 
         // Second call with same data should still work.
-        let edges2 = build_leaf_with_buffers(&data, 2, &indices, 2, Metric::L2, &mut bufs);
+        let edges2 = build_leaf_with_buffers(&src, &indices, 2, Metric::L2, &mut bufs);
         assert_eq!(
             edges1.len(),
             edges2.len(),
@@ -716,8 +724,9 @@ mod tests {
         // Verify that build_leaf produces bi-directed edges:
         // if (a -> b) exists, then (b -> a) should also exist.
         let data = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5];
+        let src = SliceDataSource::new(&data, 5, 2);
         let indices = vec![0, 1, 2, 3, 4];
-        let edges = build_leaf(&data, 2, &indices, 2, Metric::L2);
+        let edges = build_leaf(&src, &indices, 2, Metric::L2);
 
         // Collect directed edges as a set.
         let edge_set: std::collections::HashSet<(usize, usize)> =
@@ -746,8 +755,9 @@ mod tests {
             0.0, 1.0, // point 2: unit y (orthogonal)
             1.0, 1.0, // point 3: 45 degrees
         ];
+        let src = SliceDataSource::new(&data, 4, 2);
         let indices = vec![0, 1, 2, 3];
-        let edges = build_leaf(&data, 2, &indices, 2, Metric::Cosine);
+        let edges = build_leaf(&src, &indices, 2, Metric::Cosine);
 
         assert!(!edges.is_empty());
         // Points 0 and 1 are co-linear — cosine distance should be ~0.
@@ -766,8 +776,9 @@ mod tests {
         let data = vec![
             1.0, 0.0, 0.0, 1.0, 1.0, 1.0, // dot with self = 2, dot with (1,0) = 1
         ];
+        let src = SliceDataSource::new(&data, 3, 2);
         let indices = vec![0, 1, 2];
-        let edges = build_leaf(&data, 2, &indices, 1, Metric::InnerProduct);
+        let edges = build_leaf(&src, &indices, 1, Metric::InnerProduct);
         assert!(!edges.is_empty());
     }
 
@@ -775,8 +786,9 @@ mod tests {
     fn test_build_leaf_large_k_clamped() {
         // k=1000 on 5 points should produce all-pairs edges (clamped to n-1=4).
         let data = vec![0.0f32; 5 * 4];
+        let src = SliceDataSource::new(&data, 5, 4);
         let indices = vec![0, 1, 2, 3, 4];
-        let edges = build_leaf(&data, 4, &indices, 1000, Metric::L2);
+        let edges = build_leaf(&src, &indices, 1000, Metric::L2);
         let edge_set: std::collections::HashSet<(usize, usize)> =
             edges.iter().map(|e| (e.src, e.dst)).collect();
         // All pairs should exist.
@@ -798,9 +810,10 @@ mod tests {
     fn test_build_leaf_distances_nonnegative() {
         // All distance metrics should produce non-negative distances.
         let data = vec![-1.5, 2.3, 0.1, 0.7, -0.4, 1.9, 1.0, 1.0, 1.0];
+        let src = SliceDataSource::new(&data, 3, 3);
         let indices = vec![0, 1, 2];
         for metric in [Metric::L2, Metric::Cosine, Metric::CosineNormalized] {
-            let edges = build_leaf(&data, 3, &indices, 2, metric);
+            let edges = build_leaf(&src, &indices, 2, metric);
             for e in &edges {
                 assert!(
                     e.distance >= 0.0,
@@ -825,14 +838,16 @@ mod tests {
     fn test_build_leaf_buffer_reuse_different_sizes() {
         // First call with large leaf, second with small — buffers should handle both.
         let data_large = vec![1.0f32; 20 * 4];
+        let src_large = SliceDataSource::new(&data_large, 20, 4);
         let indices_large: Vec<usize> = (0..20).collect();
-        let edges1 = build_leaf(&data_large, 4, &indices_large, 2, Metric::L2);
+        let edges1 = build_leaf(&src_large, &indices_large, 2, Metric::L2);
         assert!(!edges1.is_empty());
 
         // Second call with smaller leaf on same thread — should reuse thread-local buffers.
         let data_small = vec![1.0f32; 4 * 4];
+        let src_small = SliceDataSource::new(&data_small, 4, 4);
         let indices_small: Vec<usize> = (0..4).collect();
-        let edges2 = build_leaf(&data_small, 4, &indices_small, 2, Metric::L2);
+        let edges2 = build_leaf(&src_small, &indices_small, 2, Metric::L2);
         assert!(
             !edges2.is_empty(),
             "small leaf after large should work with reused buffers"

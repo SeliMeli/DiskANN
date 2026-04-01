@@ -10,6 +10,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{Rng, SeedableRng};
 
+use diskann_pipnn::data_source::SliceDataSource;
 use diskann_pipnn::gemm;
 use diskann_pipnn::hash_prune::HashPrune;
 use diskann_pipnn::leaf_build;
@@ -118,6 +119,7 @@ fn bench_build_leaf(c: &mut Criterion) {
 
     for &(n, ndims, k) in &[(128, 128, 3), (512, 128, 4), (1024, 128, 4), (512, 384, 5)] {
         let data = random_data(n, ndims, 42);
+        let src = SliceDataSource::new(&data, n, ndims);
         let indices: Vec<usize> = (0..n).collect();
 
         group.throughput(Throughput::Elements(n as u64));
@@ -126,7 +128,7 @@ fn bench_build_leaf(c: &mut Criterion) {
             &(),
             |b, _| {
                 b.iter(|| {
-                    leaf_build::build_leaf(&data, ndims, &indices, k, Metric::L2);
+                    leaf_build::build_leaf(&src, &indices, k, Metric::L2);
                 });
             },
         );
@@ -172,8 +174,9 @@ fn bench_hash_prune_add_edges(c: &mut Criterion) {
         let leaf_size = 512;
         let k = 4;
         let leaf_data = random_data(leaf_size, ndims, 99);
+        let leaf_src = SliceDataSource::new(&leaf_data, leaf_size, ndims);
         let leaf_indices: Vec<usize> = (0..leaf_size).collect();
-        let edges = leaf_build::build_leaf(&leaf_data, ndims, &leaf_indices, k, Metric::L2);
+        let edges = leaf_build::build_leaf(&leaf_src, &leaf_indices, k, Metric::L2);
 
         group.throughput(Throughput::Elements(edges.len() as u64));
         group.bench_with_input(BenchmarkId::new("npoints", npoints), &(), |b, _| {
@@ -195,6 +198,7 @@ fn bench_partition(c: &mut Criterion) {
 
     for &(npoints, ndims) in &[(10_000, 128), (50_000, 128), (10_000, 384)] {
         let data = random_data(npoints, ndims, 42);
+        let src = SliceDataSource::new(&data, npoints, ndims);
         let indices: Vec<usize> = (0..npoints).collect();
         let config = PartitionConfig {
             c_max: 1024,
@@ -210,7 +214,7 @@ fn bench_partition(c: &mut Criterion) {
             &(),
             |b, _| {
                 b.iter(|| {
-                    partition::parallel_partition(&data, ndims, &indices, &config, 42);
+                    partition::parallel_partition(&src, &indices, &config, 42);
                 });
             },
         );

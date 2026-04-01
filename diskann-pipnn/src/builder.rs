@@ -19,6 +19,7 @@ use std::time::Instant;
 use diskann::utils::VectorRepr;
 use rayon::prelude::*;
 
+use crate::data_source::SliceDataSource;
 use crate::hash_prune::HashPrune;
 use crate::leaf_build;
 use crate::partition::{self, PartitionConfig};
@@ -675,6 +676,9 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
     let sketch_secs = t0.elapsed().as_secs_f64();
     tracing::info!(elapsed_secs = sketch_secs, "HashPrune init complete");
 
+    // Wrap data in a VectorDataSource for partition/leaf_build.
+    let data_source = SliceDataSource::new(data, npoints, ndims);
+
     // Run multiple replicas of partitioning + leaf building.
     let mut partition_secs = 0.0f64;
     let mut leaf_build_secs = 0.0f64;
@@ -697,7 +701,7 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
         let leaves = if let Some(ref q) = qdata {
             partition::parallel_partition_quantized(q, &indices, &partition_config, seed)
         } else {
-            partition::parallel_partition(data, ndims, &indices, &partition_config, seed)
+            partition::parallel_partition(&data_source, &indices, &partition_config, seed)
         };
         partition_secs += t1.elapsed().as_secs_f64();
 
@@ -738,7 +742,7 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
             let edges = if let Some(ref q) = qdata {
                 leaf_build::build_leaf_quantized(q, &leaf.indices, config.k)
             } else {
-                leaf_build::build_leaf(data, ndims, &leaf.indices, config.k, config.metric)
+                leaf_build::build_leaf(&data_source, &leaf.indices, config.k, config.metric)
             };
             total_edges.fetch_add(edges.len(), Ordering::Relaxed);
             hash_prune.add_edges_batched(&edges);
