@@ -494,13 +494,71 @@ where
                     .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
             }
             _ => {
-                // Full precision or PQ build quantization — load data in native type
-                // and use build_typed to avoid upfront f32 conversion (saves ~793 MB
-                // peak RSS for f16 data).
-                let (npoints, ndims, data) =
-                    load_data_typed::<Data::VectorDataType, _>(&data_path, self.storage_provider)?;
-                builder::build_typed(&data, npoints, ndims, &config)
-                    .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
+                // Estimate whether the dataset fits in RAM for one-shot build.
+                // Fixed overhead: HashPrune reservoirs + LSH sketches.
+                // Variable: data vectors (one-shot loads all, sharded loads one shard at a time).
+                let type_size = std::mem::size_of::<Data::VectorDataType>();
+                let npoints = self.index_configuration.max_points;
+                let ndims = self.index_configuration.dim;
+                let data_bytes = npoints as f64 * ndims as f64 * type_size as f64;
+                let reservoir_bytes = npoints as f64 * config.l_max as f64 * 8.0;
+                let sketch_bytes = npoints as f64 * config.num_hash_planes as f64 * 4.0;
+                let overhead = 500.0 * 1024.0 * 1024.0; // 500 MB headroom
+                let estimated_oneshot = data_bytes + reservoir_bytes + sketch_bytes + overhead;
+                let ram_limit = self.disk_build_param.build_memory_limit().in_bytes() as f64;
+
+                if estimated_oneshot > ram_limit && npoints > config.c_max * 4 {
+                    info!(
+                        "PiPNN sharded build: estimated {:.1} GB > limit {:.1} GB",
+                        estimated_oneshot / (1024.0 * 1024.0 * 1024.0),
+                        ram_limit / (1024.0 * 1024.0 * 1024.0),
+                    );
+                    // Compute shard size: each shard's data should fit in
+                    // (ram_limit - fixed) bytes.
+                    let fixed_bytes = reservoir_bytes + sketch_bytes + overhead;
+                    let per_shard_budget = (ram_limit - fixed_bytes).max(512.0 * 1024.0 * 1024.0);
+                    let pts_per_shard = (per_shard_budget / (ndims as f64 * type_size as f64))
+                        .floor() as usize;
+                    let pts_per_shard = pts_per_shard.max(config.c_max * 4).min(npoints);
+                    let num_shards = (npoints + pts_per_shard - 1) / pts_per_shard;
+
+                    let shard_ranges: Vec<(usize, usize)> = (0..num_shards)
+                        .map(|i| {
+                            let offset = i * pts_per_shard;
+                            let count = pts_per_shard.min(npoints - offset);
+                            (offset, count)
+                        })
+                        .collect();
+
+                    info!(
+                        "Sharded PiPNN: {} shards of ~{} points each",
+                        num_shards, pts_per_shard
+                    );
+
+                    let data_path_owned = data_path.clone();
+                    builder::build_sharded(
+                        npoints,
+                        ndims,
+                        &config,
+                        &shard_ranges,
+                        |shard_id| {
+                            let (offset, count) = shard_ranges[shard_id];
+                            diskann_pipnn::data_source::MmapDataSource::<Data::VectorDataType>::open(
+                                std::path::Path::new(&data_path_owned),
+                                offset,
+                                Some(count),
+                            )
+                            .expect("mmap shard open")
+                        },
+                    )
+                    .map_err(|e| ANNError::log_index_error(format!("PiPNN sharded build failed: {}", e)))?
+                } else {
+                    // One-shot build: load all data into memory.
+                    let (npoints, ndims, data) =
+                        load_data_typed::<Data::VectorDataType, _>(&data_path, self.storage_provider)?;
+                    builder::build_typed(&data, npoints, ndims, &config)
+                        .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
+                }
             }
         };
 
