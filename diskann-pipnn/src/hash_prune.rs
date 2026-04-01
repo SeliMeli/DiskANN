@@ -18,6 +18,9 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
+use crate::data_source::PointSource;
+use crate::PiPNNResult;
+
 /// Precomputed LSH sketches for a set of vectors.
 ///
 /// For each vector v, Sketch(v) = [v . H_i for i=0..m] where H_i are random hyperplanes.
@@ -92,6 +95,56 @@ impl LshSketches {
             sketches,
             npoints,
         }
+    }
+
+    pub(crate) fn new_from_source<S: PointSource>(
+        source: &S,
+        npoints: usize,
+        ndims: usize,
+        num_planes: usize,
+        seed: u64,
+    ) -> PiPNNResult<Self> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let hyperplanes: Vec<f32> = (0..num_planes * ndims)
+            .map(|_| StandardNormal.sample(&mut rng))
+            .collect();
+        let mut sketches = vec![0.0f32; npoints * num_planes];
+
+        let chunk_size =
+            ((16 * 1024 * 1024) / (ndims.max(1) * std::mem::size_of::<f32>())).clamp(256, 8192);
+        let mut chunk_indices = Vec::with_capacity(chunk_size);
+        let mut chunk_data = vec![0.0f32; chunk_size * ndims];
+
+        let mut start = 0usize;
+        while start < npoints {
+            let end = (start + chunk_size).min(npoints);
+            let count = end - start;
+            chunk_indices.clear();
+            chunk_indices.extend(start..end);
+            source.copy_points_into(&chunk_indices, &mut chunk_data[..count * ndims])?;
+
+            for i in 0..count {
+                let point = &chunk_data[i * ndims..(i + 1) * ndims];
+                let sketch_row =
+                    &mut sketches[(start + i) * num_planes..(start + i + 1) * num_planes];
+                for j in 0..num_planes {
+                    let plane = &hyperplanes[j * ndims..(j + 1) * ndims];
+                    let mut dot = 0.0f32;
+                    for d in 0..ndims {
+                        dot += point[d] * plane[d];
+                    }
+                    sketch_row[j] = dot;
+                }
+            }
+
+            start = end;
+        }
+
+        Ok(Self {
+            num_planes,
+            sketches,
+            npoints,
+        })
     }
 
     /// Create LSH sketches from 1-bit quantized data.
@@ -394,6 +447,25 @@ impl HashPrune {
         );
 
         Self::from_sketches(sketches, npoints, l_max, max_degree)
+    }
+
+    pub(crate) fn new_from_source<S: PointSource>(
+        source: &S,
+        npoints: usize,
+        ndims: usize,
+        num_planes: usize,
+        l_max: usize,
+        max_degree: usize,
+        seed: u64,
+    ) -> PiPNNResult<Self> {
+        let t0 = std::time::Instant::now();
+        let sketches = LshSketches::new_from_source(source, npoints, ndims, num_planes, seed)?;
+        tracing::debug!(
+            elapsed_secs = t0.elapsed().as_secs_f64(),
+            "sketch computation"
+        );
+
+        Ok(Self::from_sketches(sketches, npoints, l_max, max_degree))
     }
 
     /// Create a HashPrune from pre-computed LSH sketches.

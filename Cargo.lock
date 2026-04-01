@@ -827,6 +827,7 @@ dependencies = [
  "criterion",
  "diskann",
  "diskann-linalg",
+ "diskann-providers",
  "diskann-quantization",
  "diskann-utils",
  "diskann-vector",

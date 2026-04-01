@@ -18,6 +18,9 @@ use diskann::utils::VectorRepr;
 use diskann_vector::distance::SquaredL2;
 use diskann_vector::PureDistanceFunction;
 
+use crate::data_source::PointSource;
+use crate::PiPNNResult;
+
 /// Thread-local reusable buffers for leaf building.
 /// Avoids repeated allocation/deallocation of large matrices.
 pub struct LeafBuffers {
@@ -190,6 +193,24 @@ pub fn build_leaf<T: VectorRepr>(
     })
 }
 
+pub(crate) fn build_leaf_from_source<S: PointSource>(
+    source: &S,
+    ndims: usize,
+    indices: &[usize],
+    k: usize,
+    metric: diskann_vector::distance::Metric,
+) -> PiPNNResult<Vec<Edge>> {
+    let n = indices.len();
+    if n <= 1 {
+        return Ok(Vec::new());
+    }
+
+    LEAF_BUFFERS.with(|cell| {
+        let mut bufs = cell.borrow_mut();
+        build_leaf_with_buffers_from_source(source, ndims, indices, k, metric, &mut bufs)
+    })
+}
+
 fn build_leaf_with_buffers<T: VectorRepr>(
     data: &[T],
     ndims: usize,
@@ -285,6 +306,98 @@ fn build_leaf_with_buffers<T: VectorRepr>(
     let seen = &mut bufs.seen[..n * n];
     seen.fill(false);
     make_bidirected_edges(&local_edges, dist_matrix, n, indices, seen)
+}
+
+fn build_leaf_with_buffers_from_source<S: PointSource>(
+    source: &S,
+    ndims: usize,
+    indices: &[usize],
+    k: usize,
+    metric: diskann_vector::distance::Metric,
+    bufs: &mut LeafBuffers,
+) -> PiPNNResult<Vec<Edge>> {
+    let n = indices.len();
+    bufs.ensure_capacity(n, ndims);
+
+    let local_data = &mut bufs.local_data[..n * ndims];
+    source.copy_points_into(indices, local_data)?;
+
+    let norms_sq = &mut bufs.norms_sq[..n];
+    for i in 0..n {
+        let row = &local_data[i * ndims..(i + 1) * ndims];
+        let mut norm = 0.0f32;
+        for &v in row {
+            norm += v * v;
+        }
+        norms_sq[i] = norm;
+    }
+
+    let dot_matrix = &mut bufs.dot_matrix[..n * n];
+    crate::gemm::sgemm_aat(local_data, n, ndims, dot_matrix);
+
+    let norms_sq = &bufs.norms_sq[..n];
+    use diskann_vector::distance::Metric;
+    let dist_matrix = match metric {
+        Metric::CosineNormalized => {
+            for i in 0..n {
+                let row = &mut dot_matrix[i * n..(i + 1) * n];
+                for val in row.iter_mut() {
+                    *val = (1.0 - *val).max(0.0);
+                }
+                row[i] = f32::MAX;
+            }
+            &mut bufs.dot_matrix[..n * n]
+        }
+        Metric::Cosine => {
+            let dist = &mut bufs.dist_matrix[..n * n];
+            for i in 0..n {
+                let ni_sqrt = norms_sq[i].sqrt();
+                for j in 0..n {
+                    let denom = ni_sqrt * norms_sq[j].sqrt();
+                    let cos_sim = if denom > 0.0 {
+                        dot_matrix[i * n + j] / denom
+                    } else {
+                        0.0
+                    };
+                    dist[i * n + j] = (1.0 - cos_sim).max(0.0);
+                }
+                dist[i * n + i] = f32::MAX;
+            }
+            dist
+        }
+        Metric::L2 => {
+            let dist = &mut bufs.dist_matrix[..n * n];
+            for i in 0..n {
+                let ni = norms_sq[i];
+                for j in 0..n {
+                    dist[i * n + j] = (ni + norms_sq[j] - 2.0 * dot_matrix[i * n + j]).max(0.0);
+                }
+                dist[i * n + i] = f32::MAX;
+            }
+            dist
+        }
+        Metric::InnerProduct => {
+            for i in 0..n {
+                let row = &mut dot_matrix[i * n..(i + 1) * n];
+                for val in row.iter_mut() {
+                    *val = -*val;
+                }
+                row[i] = f32::MAX;
+            }
+            &mut bufs.dot_matrix[..n * n]
+        }
+    };
+
+    let local_edges = extract_knn(dist_matrix, n, k);
+    let seen = &mut bufs.seen[..n * n];
+    seen.fill(false);
+    Ok(make_bidirected_edges(
+        &local_edges,
+        dist_matrix,
+        n,
+        indices,
+        seen,
+    ))
 }
 
 /// Build a leaf using 1-bit quantized vectors with Hamming distance.

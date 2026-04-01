@@ -16,6 +16,9 @@ use rand::prelude::IndexedRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
+use crate::data_source::PointSource;
+use crate::PiPNNResult;
+
 /// Maximum recursion depth to prevent stack overflow.
 const MAX_DEPTH: usize = 30;
 
@@ -704,6 +707,330 @@ pub fn stream_partition_subtrees<T: VectorRepr + Send + Sync, F: FnMut(Vec<Leaf>
             emit(partition(data, ndims, &cluster, config, 1, &mut sub_rng));
         }
     }
+}
+
+fn compute_centroid_from_source<S: PointSource>(
+    source: &S,
+    ndims: usize,
+    indices: &[usize],
+) -> PiPNNResult<Vec<f32>> {
+    let mut centroid = vec![0.0f32; ndims];
+    let chunk_points =
+        ((4 * 1024 * 1024) / (ndims.max(1) * std::mem::size_of::<f32>())).clamp(32, 4096);
+    let mut buffer = vec![0.0f32; chunk_points * ndims];
+
+    for chunk in indices.chunks(chunk_points) {
+        source.copy_points_into(chunk, &mut buffer[..chunk.len() * ndims])?;
+        for point in 0..chunk.len() {
+            let row = &buffer[point * ndims..(point + 1) * ndims];
+            for d in 0..ndims {
+                centroid[d] += row[d];
+            }
+        }
+    }
+
+    let inv = 1.0 / indices.len() as f32;
+    for value in &mut centroid {
+        *value *= inv;
+    }
+
+    Ok(centroid)
+}
+
+fn merge_small_into_nearest_from_source<S: PointSource>(
+    source: &S,
+    ndims: usize,
+    mut clusters: Vec<Vec<usize>>,
+    c_min: usize,
+) -> PiPNNResult<Vec<Vec<usize>>> {
+    let mut large: Vec<Vec<usize>> = Vec::new();
+    let mut smalls: Vec<Vec<usize>> = Vec::new();
+
+    for cluster in clusters.drain(..) {
+        if cluster.len() < c_min && !cluster.is_empty() {
+            smalls.push(cluster);
+        } else if !cluster.is_empty() {
+            large.push(cluster);
+        }
+    }
+
+    if smalls.is_empty() || large.is_empty() {
+        if large.is_empty() {
+            return Ok(smalls);
+        }
+        return Ok(large);
+    }
+
+    let centroids: Vec<Vec<f32>> = large
+        .iter()
+        .map(|cluster| compute_centroid_from_source(source, ndims, cluster))
+        .collect::<PiPNNResult<_>>()?;
+
+    for small in smalls {
+        let rep_buf = compute_centroid_from_source(source, ndims, &small)?;
+        let nearest = centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut dist = 0.0f32;
+                for d in 0..ndims {
+                    let diff = rep_buf[d] - c[d];
+                    dist += diff * diff;
+                }
+                (i, dist)
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        large[nearest].extend(small);
+    }
+
+    Ok(large)
+}
+
+fn partition_assign_from_source<S: PointSource>(
+    source: &S,
+    ndims: usize,
+    points: &[usize],
+    leaders: &[usize],
+    fanout: usize,
+    metric: diskann_vector::distance::Metric,
+) -> PiPNNResult<Vec<Vec<usize>>> {
+    let np = points.len();
+    let nl = leaders.len();
+    let num_assign = fanout.min(nl);
+
+    use diskann_vector::distance::Metric;
+
+    let mut l_data = vec![0.0f32; nl * ndims];
+    source.copy_points_into(leaders, &mut l_data)?;
+
+    let l_norms: Vec<f32> = match metric {
+        Metric::L2 => {
+            let mut norms = vec![0.0f32; nl];
+            for i in 0..nl {
+                let row = &l_data[i * ndims..(i + 1) * ndims];
+                let mut norm = 0.0f32;
+                for &v in row {
+                    norm += v * v;
+                }
+                norms[i] = norm;
+            }
+            norms
+        }
+        Metric::Cosine => {
+            let mut norms = vec![0.0f32; nl];
+            for i in 0..nl {
+                let row = &l_data[i * ndims..(i + 1) * ndims];
+                let mut norm = 0.0f32;
+                for &v in row {
+                    norm += v * v;
+                }
+                norms[i] = norm.sqrt();
+            }
+            norms
+        }
+        Metric::CosineNormalized | Metric::InnerProduct => Vec::new(),
+    };
+
+    let mut assignments = vec![0u32; np * num_assign];
+    let stripe = ((16 * 1024 * 1024) / (nl.max(1) * std::mem::size_of::<f32>())).clamp(256, 16_384);
+    let mut p_data = vec![0.0f32; stripe * ndims];
+    let mut dots = vec![0.0f32; stripe * nl];
+    let mut buf: Vec<(u32, f32)> = Vec::with_capacity(nl);
+
+    let mut start = 0usize;
+    while start < np {
+        let end = (start + stripe).min(np);
+        let sn = end - start;
+        let stripe_points = &points[start..end];
+        source.copy_points_into(stripe_points, &mut p_data[..sn * ndims])?;
+
+        crate::gemm::sgemm_abt(
+            &p_data[..sn * ndims],
+            sn,
+            ndims,
+            &l_data,
+            nl,
+            &mut dots[..sn * nl],
+        );
+
+        for i in 0..sn {
+            let dot_row = &dots[i * nl..(i + 1) * nl];
+            buf.clear();
+            match metric {
+                Metric::CosineNormalized => {
+                    for (j, &dot_val) in dot_row.iter().enumerate() {
+                        buf.push((j as u32, (1.0 - dot_val).max(0.0)));
+                    }
+                }
+                Metric::Cosine => {
+                    let mut pi = 0.0f32;
+                    let row = &p_data[i * ndims..(i + 1) * ndims];
+                    for &v in row {
+                        pi += v * v;
+                    }
+                    let pi_sqrt = pi.sqrt();
+                    for (j, &dot_val) in dot_row.iter().enumerate() {
+                        let denom = pi_sqrt * l_norms[j];
+                        let cos_sim = if denom > 0.0 { dot_val / denom } else { 0.0 };
+                        buf.push((j as u32, (1.0 - cos_sim).max(0.0)));
+                    }
+                }
+                Metric::L2 => {
+                    let mut pi = 0.0f32;
+                    let row = &p_data[i * ndims..(i + 1) * ndims];
+                    for &v in row {
+                        pi += v * v;
+                    }
+                    for (j, &dot_val) in dot_row.iter().enumerate() {
+                        let d = (pi + l_norms[j] - 2.0 * dot_val).max(0.0);
+                        buf.push((j as u32, d));
+                    }
+                }
+                Metric::InnerProduct => {
+                    for (j, &dot_val) in dot_row.iter().enumerate() {
+                        buf.push((j as u32, -dot_val));
+                    }
+                }
+            }
+
+            if num_assign > 0 && num_assign < buf.len() {
+                buf.select_nth_unstable_by(num_assign - 1, |a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+
+            let out = &mut assignments[(start + i) * num_assign..(start + i + 1) * num_assign];
+            for k in 0..num_assign {
+                out[k] = buf[k].0;
+            }
+        }
+
+        start = end;
+    }
+
+    let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); nl];
+    for i in 0..np {
+        let row = &assignments[i * num_assign..(i + 1) * num_assign];
+        for &li in row {
+            clusters[li as usize].push(i);
+        }
+    }
+    Ok(clusters)
+}
+
+fn partition_from_source<S: PointSource>(
+    source: &S,
+    ndims: usize,
+    indices: &[usize],
+    config: &PartitionConfig,
+    level: usize,
+    rng: &mut impl Rng,
+) -> PiPNNResult<Vec<Leaf>> {
+    let n = indices.len();
+    if n <= config.c_max {
+        return Ok(vec![Leaf {
+            indices: indices.to_vec(),
+        }]);
+    }
+    if level >= MAX_DEPTH {
+        return Ok(force_split(indices, config.c_max));
+    }
+
+    let fanout = if level < config.fanout.len() {
+        config.fanout[level]
+    } else {
+        1
+    };
+    let num_leaders = sample_num_leaders(n, config.p_samp);
+    let leaders: Vec<usize> = indices.choose_multiple(rng, num_leaders).copied().collect();
+    let clusters_local =
+        partition_assign_from_source(source, ndims, indices, &leaders, fanout, config.metric)?;
+    let clusters: Vec<Vec<usize>> = clusters_local
+        .into_iter()
+        .map(|local_cluster| local_cluster.into_iter().map(|li| indices[li]).collect())
+        .collect();
+
+    let merged_clusters =
+        merge_small_into_nearest_from_source(source, ndims, clusters, config.c_min)?;
+    if merged_clusters.len() == 1 && merged_clusters[0].len() > config.c_max {
+        return Ok(force_split(&merged_clusters[0], config.c_max));
+    }
+
+    let mut leaves = Vec::new();
+    for cluster in merged_clusters {
+        if cluster.len() <= config.c_max {
+            leaves.push(Leaf { indices: cluster });
+        } else {
+            let sub_seed: u64 = rng.random();
+            let mut sub_rng = rand::rngs::StdRng::seed_from_u64(sub_seed);
+            let sub_leaves =
+                partition_from_source(source, ndims, &cluster, config, level + 1, &mut sub_rng)?;
+            leaves.extend(sub_leaves);
+        }
+    }
+
+    Ok(leaves)
+}
+
+pub(crate) fn stream_partition_subtrees_from_source<S: PointSource, F>(
+    source: &S,
+    ndims: usize,
+    indices: &[usize],
+    config: &PartitionConfig,
+    seed: u64,
+    mut emit: F,
+) -> PiPNNResult<()>
+where
+    F: FnMut(Vec<Leaf>) -> PiPNNResult<()>,
+{
+    let n = indices.len();
+    if n <= config.c_max {
+        return emit(vec![Leaf {
+            indices: indices.to_vec(),
+        }]);
+    }
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let fanout = if !config.fanout.is_empty() {
+        config.fanout[0]
+    } else {
+        3
+    };
+    let num_leaders = sample_num_leaders(n, config.p_samp);
+    let leaders: Vec<usize> = indices
+        .choose_multiple(&mut rng, num_leaders)
+        .copied()
+        .collect();
+
+    let clusters_local =
+        partition_assign_from_source(source, ndims, indices, &leaders, fanout, config.metric)?;
+    let clusters: Vec<Vec<usize>> = clusters_local
+        .into_iter()
+        .map(|local_cluster| local_cluster.into_iter().map(|li| indices[li]).collect())
+        .collect();
+    let merged_clusters =
+        merge_small_into_nearest_from_source(source, ndims, clusters, config.c_min)?;
+    let sub_seeds: Vec<u64> = (0..merged_clusters.len()).map(|_| rng.random()).collect();
+
+    for (cluster, sub_seed) in merged_clusters.into_iter().zip(sub_seeds.into_iter()) {
+        if cluster.len() <= config.c_max {
+            emit(vec![Leaf { indices: cluster }])?;
+        } else {
+            let mut sub_rng = rand::rngs::StdRng::seed_from_u64(sub_seed);
+            emit(partition_from_source(
+                source,
+                ndims,
+                &cluster,
+                config,
+                1,
+                &mut sub_rng,
+            )?)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Quantized version of parallel_partition using Hamming distance on 1-bit data.

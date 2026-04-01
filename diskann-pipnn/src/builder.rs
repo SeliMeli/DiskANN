@@ -17,8 +17,10 @@
 use std::time::Instant;
 
 use diskann::utils::VectorRepr;
+use diskann_providers::storage::StorageReadProvider;
 use rayon::prelude::*;
 
+use crate::data_source::{FilePointSource, PointSource};
 use crate::hash_prune::HashPrune;
 use crate::leaf_build;
 use crate::partition::{self, PartitionConfig};
@@ -297,6 +299,62 @@ fn find_medoid<T: VectorRepr>(data: &[T], npoints: usize, ndims: usize) -> usize
     best_idx
 }
 
+fn find_medoid_from_source<S: PointSource>(
+    source: &S,
+    npoints: usize,
+    ndims: usize,
+) -> PiPNNResult<usize> {
+    let dist_fn = make_dist_fn(Metric::L2);
+    let chunk_points =
+        ((4 * 1024 * 1024) / (ndims.max(1) * std::mem::size_of::<f32>())).clamp(32, 4096);
+    let mut chunk_indices = Vec::with_capacity(chunk_points);
+    let mut chunk_data = vec![0.0f32; chunk_points * ndims];
+    let mut centroid = vec![0.0f32; ndims];
+
+    let mut start = 0usize;
+    while start < npoints {
+        let end = (start + chunk_points).min(npoints);
+        let count = end - start;
+        chunk_indices.clear();
+        chunk_indices.extend(start..end);
+        source.copy_points_into(&chunk_indices, &mut chunk_data[..count * ndims])?;
+        for point in 0..count {
+            let row = &chunk_data[point * ndims..(point + 1) * ndims];
+            for d in 0..ndims {
+                centroid[d] += row[d];
+            }
+        }
+        start = end;
+    }
+
+    let inv_n = 1.0 / npoints as f32;
+    for c in &mut centroid {
+        *c *= inv_n;
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_dist = f32::MAX;
+    let mut start = 0usize;
+    while start < npoints {
+        let end = (start + chunk_points).min(npoints);
+        let count = end - start;
+        chunk_indices.clear();
+        chunk_indices.extend(start..end);
+        source.copy_points_into(&chunk_indices, &mut chunk_data[..count * ndims])?;
+        for point in 0..count {
+            let row = &chunk_data[point * ndims..(point + 1) * ndims];
+            let dist = dist_fn.call(row, &centroid);
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = start + point;
+            }
+        }
+        start = end;
+    }
+
+    Ok(best_idx)
+}
+
 fn effective_num_threads(config: &PiPNNConfig) -> usize {
     if config.num_threads > 0 {
         config.num_threads
@@ -419,6 +477,23 @@ fn build_internal_streaming<T: VectorRepr + Send + Sync>(
     build_internal_streaming_impl(data, npoints, ndims, config)
 }
 
+fn build_internal_streaming_from_source<S: PointSource>(
+    source: &S,
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+) -> PiPNNResult<PiPNNGraph> {
+    if config.num_threads > 0 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.num_threads)
+            .build()
+            .map_err(|e| PiPNNError::Config(format!("Failed to create thread pool: {}", e)))?;
+        return pool
+            .install(|| build_internal_streaming_from_source_impl(source, npoints, ndims, config));
+    }
+    build_internal_streaming_from_source_impl(source, npoints, ndims, config)
+}
+
 #[allow(clippy::disallowed_methods)]
 fn build_internal_streaming_impl<T: VectorRepr + Send + Sync>(
     data: &[T],
@@ -530,6 +605,124 @@ fn build_internal_streaming_impl<T: VectorRepr + Send + Sync>(
     })
 }
 
+#[allow(clippy::disallowed_methods)]
+fn build_internal_streaming_from_source_impl<S: PointSource>(
+    source: &S,
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+) -> PiPNNResult<PiPNNGraph> {
+    if config.final_prune {
+        return Err(PiPNNError::Config(
+            "final_prune=true is not supported for the over-budget streaming PiPNN path yet".into(),
+        ));
+    }
+
+    let t_total = Instant::now();
+    let medoid = find_medoid_from_source(source, npoints, ndims)?;
+
+    let t0 = Instant::now();
+    let hash_prune = HashPrune::new_from_source(
+        source,
+        npoints,
+        ndims,
+        config.num_hash_planes,
+        config.l_max,
+        config.max_degree,
+        42,
+    )?;
+    let sketch_secs = t0.elapsed().as_secs_f64();
+    tracing::info!(elapsed_secs = sketch_secs, "HashPrune init complete");
+
+    let mut partition_secs = 0.0f64;
+    let mut leaf_build_secs = 0.0f64;
+    let mut total_leaves = 0usize;
+    let mut total_edges_count = 0usize;
+
+    for replica in 0..config.replicas {
+        let seed = 1000 + replica as u64 * 7919;
+        let partition_config = PartitionConfig {
+            c_max: config.c_max,
+            c_min: config.c_min,
+            p_samp: config.p_samp,
+            fanout: config.fanout.clone(),
+            metric: config.metric,
+        };
+
+        let indices: Vec<usize> = (0..npoints).collect();
+        let replica_start = Instant::now();
+        let mut replica_leaf_secs = 0.0f64;
+
+        partition::stream_partition_subtrees_from_source(
+            source,
+            ndims,
+            &indices,
+            &partition_config,
+            seed,
+            |leaves| {
+                total_leaves += leaves.len();
+
+                let t_leaf = Instant::now();
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let total_edges = AtomicUsize::new(0);
+
+                leaves.par_iter().try_for_each(|leaf| -> PiPNNResult<()> {
+                    let edges = leaf_build::build_leaf_from_source(
+                        source,
+                        ndims,
+                        &leaf.indices,
+                        config.k,
+                        config.metric,
+                    )?;
+                    total_edges.fetch_add(edges.len(), Ordering::Relaxed);
+                    hash_prune.add_edges_batched(&edges);
+                    Ok(())
+                })?;
+
+                total_edges_count += total_edges.load(Ordering::Relaxed);
+                replica_leaf_secs += t_leaf.elapsed().as_secs_f64();
+                Ok(())
+            },
+        )?;
+
+        let replica_total_secs = replica_start.elapsed().as_secs_f64();
+        partition_secs += (replica_total_secs - replica_leaf_secs).max(0.0);
+        leaf_build_secs += replica_leaf_secs;
+    }
+
+    (0..rayon::current_num_threads())
+        .into_par_iter()
+        .for_each(|_| {
+            leaf_build::release_thread_buffers();
+        });
+
+    let t3 = Instant::now();
+    let adjacency = hash_prune.extract_graph();
+    let extract_secs = t3.elapsed().as_secs_f64();
+    let final_prune_secs = 0.0;
+    let total_secs = t_total.elapsed().as_secs_f64();
+
+    let build_stats = PiPNNBuildStats {
+        total_secs,
+        sketch_secs,
+        partition_secs,
+        leaf_build_secs,
+        extract_secs,
+        final_prune_secs,
+        num_leaves: total_leaves,
+        total_edges: total_edges_count,
+    };
+
+    Ok(PiPNNGraph {
+        adjacency,
+        npoints,
+        ndims,
+        medoid,
+        metric: config.metric,
+        build_stats,
+    })
+}
+
 pub fn build_typed_sharded_scaffold<T: VectorRepr + Send + Sync>(
     data: &[T],
     npoints: usize,
@@ -566,6 +759,40 @@ pub fn build_typed_with_memory_budget<T: VectorRepr + Send + Sync>(
     memory_budget_bytes: usize,
 ) -> PiPNNResult<PiPNNGraph> {
     build_typed_sharded_scaffold(data, npoints, ndims, config, memory_budget_bytes)
+}
+
+pub fn build_streaming_from_file<T, SP>(
+    data_path: &str,
+    storage_provider: &SP,
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    memory_budget_bytes: usize,
+) -> PiPNNResult<PiPNNGraph>
+where
+    T: VectorRepr + Send + Sync,
+    SP: StorageReadProvider,
+{
+    config.validate()?;
+
+    if npoints == 0 || ndims == 0 {
+        return Err(PiPNNError::Config("npoints and ndims must be > 0".into()));
+    }
+
+    let estimated_one_shot_peak_bytes =
+        estimate_typed_peak_memory_bytes::<T>(npoints, ndims, config);
+    let estimated_streaming_peak_bytes =
+        estimate_typed_streaming_peak_memory_bytes::<T>(npoints, ndims, config);
+    if memory_budget_bytes < estimated_streaming_peak_bytes {
+        return Err(streaming_build_impossible_error(
+            memory_budget_bytes,
+            estimated_streaming_peak_bytes,
+            estimated_one_shot_peak_bytes,
+        ));
+    }
+
+    let source = FilePointSource::<T, SP>::new(data_path, storage_provider, npoints, ndims);
+    build_internal_streaming_from_source(&source, npoints, ndims, config)
 }
 
 /// Build a PiPNN index from typed vector data.

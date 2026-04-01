@@ -28,7 +28,8 @@ use diskann_providers::{
     },
     storage::{AsyncIndexMetadata, DiskGraphOnly, PQStorage},
     utils::{
-        create_thread_pool, find_medoid_with_sampling, RayonThreadPool, VectorDataIterator,
+        create_thread_pool, find_medoid_with_sampling, load_metadata_from_file, RayonThreadPool,
+        VectorDataIterator,
         MAX_MEDOID_SAMPLE_SIZE,
     },
 };
@@ -494,20 +495,40 @@ where
                     .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
             }
             _ => {
-                // Full precision or PQ build quantization — load data in native type
-                // and use build_typed to avoid upfront f32 conversion (saves ~793 MB
-                // peak RSS for f16 data).
-                let (npoints, ndims, data) =
-                    load_data_typed::<Data::VectorDataType, _>(&data_path, self.storage_provider)?;
                 let memory_budget_bytes = self.disk_build_param.build_memory_limit().in_bytes();
-                builder::build_typed_sharded_scaffold(
-                    &data,
-                    npoints,
-                    ndims,
-                    &config,
-                    memory_budget_bytes,
-                )
-                .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
+                let (npoints, ndims, plan) =
+                    plan_typed_pipnn_build_from_metadata::<Data::VectorDataType, _>(
+                        &data_path,
+                        self.storage_provider,
+                        &config,
+                        memory_budget_bytes,
+                    )?;
+
+                match plan {
+                    builder::PiPNNBuildPlan::OneShot { .. } => {
+                        let (_, _, data) =
+                            load_data_typed::<Data::VectorDataType, _>(&data_path, self.storage_provider)?;
+                        builder::build_typed_sharded_scaffold(
+                            &data,
+                            npoints,
+                            ndims,
+                            &config,
+                            memory_budget_bytes,
+                        )
+                        .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
+                    }
+                    builder::PiPNNBuildPlan::NeedsSharded { .. } => {
+                        builder::build_streaming_from_file::<Data::VectorDataType, _>(
+                            &data_path,
+                            self.storage_provider,
+                            npoints,
+                            ndims,
+                            &config,
+                            memory_budget_bytes,
+                        )
+                        .map_err(|e| ANNError::log_index_error(format!("PiPNN build failed: {}", e)))?
+                    }
+                }
             }
         };
 
@@ -708,6 +729,30 @@ where
     let data: Vec<T> = matrix.into_inner().into_vec();
 
     Ok((npoints, ndims, data))
+}
+
+#[cfg(feature = "pipnn")]
+fn plan_typed_pipnn_build_from_metadata<T, SP>(
+    data_path: &str,
+    storage_provider: &SP,
+    config: &diskann_pipnn::PiPNNConfig,
+    memory_budget_bytes: usize,
+) -> ANNResult<(usize, usize, diskann_pipnn::builder::PiPNNBuildPlan)>
+where
+    T: VectorRepr,
+    SP: StorageReadProvider,
+{
+    let metadata = load_metadata_from_file(storage_provider, data_path)
+        .map_err(|e| ANNError::log_index_error(format!("Failed to read PiPNN input header: {}", e)))?;
+    let (npoints, ndims) = metadata.into_dims();
+    let plan = diskann_pipnn::builder::choose_typed_build_plan::<T>(
+        npoints,
+        ndims,
+        config,
+        memory_budget_bytes,
+    );
+
+    Ok((npoints, ndims, plan))
 }
 
 /// Chunked parallel quantize: read data in 100K-vector chunks, quantize each
@@ -1280,10 +1325,14 @@ impl StartPoint {
 mod start_point_tests {
     use std::io::Write;
 
+    use diskann_providers::storage::FileStorageProvider;
     use diskann_providers::storage::VirtualStorageProvider;
     use diskann_utils::io::Metadata;
+    use diskann_utils::views::MatrixView;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::build::configuration::build_algorithm::BuildAlgorithm;
 
     #[test]
     fn test_start_point_creation() {
@@ -1350,5 +1399,104 @@ mod start_point_tests {
             result.err().unwrap().kind(),
             ANNErrorKind::InvalidFileFormatError
         );
+    }
+
+    #[test]
+    fn test_plan_typed_pipnn_build_from_metadata_reads_header_only() {
+        let temp_dir = tempdir().unwrap();
+        let storage_provider = FileStorageProvider;
+        let data_path = temp_dir.path().join("pipnn_sync_streaming_test.bin");
+        let npoints = 128usize;
+        let ndims = 16usize;
+
+        Metadata::new(npoints, ndims)
+            .unwrap()
+            .write(&mut storage_provider.create_for_write(data_path.to_str().unwrap()).unwrap())
+            .unwrap();
+
+        let build_algorithm = BuildAlgorithm::PiPNN {
+            c_max: 32,
+            c_min: 8,
+            p_samp: 0.05,
+            fanout: vec![4, 2],
+            leaf_k: 3,
+            replicas: 1,
+            l_max: 32,
+            num_hash_planes: 8,
+            final_prune: false,
+        };
+        let config = build_algorithm
+            .to_pipnn_config(16, diskann_vector::distance::Metric::L2, 1.2, 1)
+            .unwrap();
+
+        let result = plan_typed_pipnn_build_from_metadata::<f32, _>(
+            data_path.to_str().unwrap(),
+            &storage_provider,
+            &config,
+            1,
+        );
+        assert!(
+            result.is_ok(),
+            "expected PiPNN plan selection to read only file metadata, got {result:?}"
+        );
+
+        let (planned_npoints, planned_ndims, decision) = result.unwrap();
+        assert_eq!(planned_npoints, npoints);
+        assert_eq!(planned_ndims, ndims);
+        assert!(matches!(decision, diskann_pipnn::builder::PiPNNBuildPlan::NeedsSharded { .. }));
+    }
+
+    #[test]
+    fn test_build_streaming_from_file_succeeds_below_one_shot_budget() {
+        let temp_dir = tempdir().unwrap();
+        let storage_provider = FileStorageProvider;
+        let data_path = temp_dir.path().join("pipnn_streaming_file_test.bin");
+        let npoints = 128usize;
+        let ndims = 16usize;
+        let data: Vec<f32> = (0..npoints * ndims).map(|i| (i % 17) as f32 / 17.0).collect();
+
+        write_bin(
+            MatrixView::try_from(data.as_slice(), npoints, ndims).unwrap(),
+            &mut storage_provider
+                .create_for_write(data_path.to_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let config = BuildAlgorithm::PiPNN {
+            c_max: 32,
+            c_min: 8,
+            p_samp: 0.05,
+            fanout: vec![4, 2],
+            leaf_k: 3,
+            replicas: 1,
+            l_max: 32,
+            num_hash_planes: 8,
+            final_prune: false,
+        }
+        .to_pipnn_config(16, diskann_vector::distance::Metric::L2, 1.2, 1)
+        .unwrap();
+
+        let one_shot_bytes =
+            diskann_pipnn::builder::estimate_typed_peak_memory_bytes::<f32>(npoints, ndims, &config);
+        let budget_bytes = one_shot_bytes - (8 * 1024 * 1024);
+
+        let result = diskann_pipnn::builder::build_streaming_from_file::<f32, _>(
+            data_path.to_str().unwrap(),
+            &storage_provider,
+            npoints,
+            ndims,
+            &config,
+            budget_bytes,
+        );
+
+        assert!(
+            result.is_ok(),
+            "expected file-backed streaming PiPNN build to succeed, got {result:?}"
+        );
+
+        let graph = result.unwrap();
+        assert_eq!(graph.npoints, npoints);
+        assert!(graph.max_degree() <= config.max_degree);
     }
 }
