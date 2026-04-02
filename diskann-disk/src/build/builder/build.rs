@@ -66,6 +66,8 @@ use crate::{
     },
     DiskIndexBuildParameters, QuantizationType,
 };
+#[cfg(feature = "pipnn")]
+use crate::utils::partition_with_ram_budget;
 
 /// Disk index builder that composes with DiskIndexBuilderCore.
 pub struct DiskIndexBuilder<'a, Data, StorageProvider>
@@ -531,6 +533,179 @@ where
         Ok(())
     }
 
+    /// PiPNN merged shard build for datasets that exceed the RAM budget.
+    ///
+    /// Same pattern as `build_merged_vamana_index`:
+    /// 1. `partition_with_ram_budget` -- K overlapping shards via streaming k-means
+    /// 2. For each shard: gather data by ID map, `build_typed`, save graph, drop
+    /// 3. `merge_shards` -- combine per-shard graphs into a single unified graph
+    /// 4. Disk layout
+    #[cfg(feature = "pipnn")]
+    fn build_sync_pipnn_merged(&mut self) -> ANNResult<()> {
+        use diskann_pipnn::builder;
+
+        let mut logger = PerfLogger::new_disk_index_build_logger();
+        let pool = create_thread_pool(self.index_configuration.num_threads)?;
+
+        // PQ compression first (same as one-shot).
+        let t_pq = std::time::Instant::now();
+        {
+            let runtime = create_runtime(self.index_configuration.num_threads)?;
+            runtime.block_on(self.generate_compressed_data(&pool))?;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            extern "C" {
+                fn malloc_trim(pad: usize) -> i32;
+            }
+            malloc_trim(0);
+        }
+        logger.log_checkpoint(DiskIndexBuildCheckpoint::PqConstruction);
+        let pq_secs = t_pq.elapsed().as_secs_f64();
+
+        // Build PiPNN config from build parameters.
+        let config = self
+            .disk_build_param
+            .build_algorithm()
+            .to_pipnn_config(
+                self.index_configuration.config.pruned_degree().get(),
+                self.index_configuration.dist_metric,
+                self.index_configuration.config.alpha(),
+                self.index_configuration.num_threads,
+            )
+            .ok_or_else(|| ANNError::log_index_error("not PiPNN"))?;
+
+        let data_path = self.index_writer.get_dataset_file();
+        let merged_index_prefix = self.index_writer.get_merged_index_prefix();
+        let max_degree = self.index_configuration.config.pruned_degree_u32().get();
+        let ndims = self.index_configuration.dim;
+        let type_size = std::mem::size_of::<Data::VectorDataType>();
+
+        // Phase 1: Partition into overlapping shards.
+        let t_part = std::time::Instant::now();
+        let k_base = 2; // each point appears in 2 shards
+        let sampling_rate = 0.05; // 5% subsample for k-means
+
+        let ram_budget = self.disk_build_param.build_memory_limit().in_bytes() as f64;
+        let ram_estimator = |npoints: u64, dim: u64| -> f64 {
+            let data = npoints as f64 * dim as f64 * type_size as f64;
+            let reservoirs = npoints as f64 * config.l_max as f64 * 8.0;
+            let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
+            let overhead = 150.0 * 1024.0 * 1024.0;
+            data + reservoirs + sketches + overhead
+        };
+
+        let mut rng = diskann_providers::utils::create_rnd_from_optional_seed(
+            self.index_configuration.random_seed,
+        );
+        let num_parts = partition_with_ram_budget::<Data::VectorDataType, _, _, _>(
+            &data_path,
+            ndims,
+            sampling_rate,
+            ram_budget,
+            k_base,
+            &merged_index_prefix,
+            self.storage_provider,
+            &mut rng,
+            &pool,
+            ram_estimator,
+        )?;
+        let part_secs = t_part.elapsed().as_secs_f64();
+        info!(
+            "PiPNN merged: partition into {} shards ({:.3}s)",
+            num_parts, part_secs
+        );
+
+        // Phase 2: Build PiPNN graph per shard.
+        let t_build = std::time::Instant::now();
+        for shard in 0..num_parts {
+            let t_shard = std::time::Instant::now();
+
+            // Load shard data using ID map.
+            let id_map_file = DiskIndexWriter::get_merged_index_subshard_id_map_file(
+                &merged_index_prefix,
+                shard,
+            );
+            let id_map = self.read_idmap(id_map_file)?;
+            let shard_npoints = id_map.len();
+
+            // Gather shard vectors from the dataset file.
+            let shard_data = gather_shard_data::<Data::VectorDataType, _>(
+                &data_path,
+                self.storage_provider,
+                &id_map,
+                ndims,
+            )?;
+
+            info!(
+                "Shard {}/{}: {} points, {:.1} MB",
+                shard,
+                num_parts,
+                shard_npoints,
+                (shard_npoints * ndims * type_size) as f64 / (1024.0 * 1024.0)
+            );
+
+            // Build one-shot PiPNN on this shard.
+            let graph = builder::build_typed(&shard_data, shard_npoints, ndims, &config)
+                .map_err(|e| {
+                    ANNError::log_index_error(format!("PiPNN shard {} build failed: {}", shard, e))
+                })?;
+
+            // Save shard graph in DiskANN format.
+            let shard_graph_file = DiskIndexWriter::get_merged_index_subshard_mem_index_file(
+                &merged_index_prefix,
+                shard,
+            );
+            graph
+                .save_graph(std::path::Path::new(&shard_graph_file))
+                .map_err(|e| {
+                    ANNError::log_index_error(format!("PiPNN shard {} save failed: {}", shard, e))
+                })?;
+
+            info!(
+                "Shard {}/{}: built in {:.3}s (avg_degree={:.1})",
+                shard,
+                num_parts,
+                t_shard.elapsed().as_secs_f64(),
+                graph.avg_degree()
+            );
+
+            // Shard data + graph dropped here -- memory freed.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                extern "C" {
+                    fn malloc_trim(pad: usize) -> i32;
+                }
+                malloc_trim(0);
+            }
+        }
+        let build_secs = t_build.elapsed().as_secs_f64();
+        logger.log_checkpoint(DiskIndexBuildCheckpoint::InmemIndexBuild);
+
+        // Phase 3: Merge shard graphs + cleanup temp files.
+        let t_merge = std::time::Instant::now();
+        self.merge_shards_and_cleanup(&merged_index_prefix, num_parts, max_degree, &mut rng)?;
+        let merge_secs = t_merge.elapsed().as_secs_f64();
+
+        // Phase 4: Disk layout.
+        let t_layout = std::time::Instant::now();
+        self.create_disk_layout()?;
+        logger.log_checkpoint(DiskIndexBuildCheckpoint::DiskLayout);
+        let layout_secs = t_layout.elapsed().as_secs_f64();
+
+        println!("PiPNN Merged Build Phases");
+        println!("  PQ compression: {:.3}s", pq_secs);
+        println!(
+            "  Partition:      {:.3}s ({} shards)",
+            part_secs, num_parts
+        );
+        println!("  Graph build:    {:.3}s", build_secs);
+        println!("  Merge:          {:.3}s", merge_secs);
+        println!("  Disk layout:    {:.3}s", layout_secs);
+
+        Ok(())
+    }
+
     async fn build_merged_vamana_index(&mut self, pool: &RayonThreadPool) -> ANNResult<()> {
         let mut logger = PerfLogger::new_disk_index_build_logger();
         let mut workflow = MergedVamanaIndexWorkflow::new(self, pool);
@@ -708,6 +883,60 @@ fn estimate_pipnn_shard_ram(
     let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
     let overhead = 150.0 * 1024.0 * 1024.0;
     data + reservoirs + sketches + overhead
+}
+
+/// Read a subset of vectors from a DiskANN `.bin` file by their global IDs.
+///
+/// Returns a contiguous `Vec<T>` in shard-local order (i.e. `result[i*ndims..(i+1)*ndims]`
+/// is the vector for `id_map[i]`). Global IDs are sorted before reading so I/O is
+/// mostly sequential, minimising seeks.
+#[cfg(feature = "pipnn")]
+fn gather_shard_data<T, SP>(
+    data_path: &str,
+    storage_provider: &SP,
+    id_map: &[u32],
+    ndims: usize,
+) -> ANNResult<Vec<T>>
+where
+    T: VectorRepr,
+    SP: StorageReadProvider,
+{
+    use std::io::{Read, Seek, SeekFrom};
+
+    let type_size = std::mem::size_of::<T>();
+    let row_bytes = ndims * type_size;
+    let shard_npoints = id_map.len();
+
+    let mut reader = storage_provider.open_reader(data_path)?;
+
+    // Skip the 8-byte header (u32 npoints + u32 ndims).
+    let mut header = [0u8; 8];
+    Read::read_exact(&mut reader, &mut header)?;
+
+    let mut data = vec![T::zeroed(); shard_npoints * ndims];
+    let mut row_buf = vec![0u8; row_bytes];
+
+    // Sort IDs so we read mostly sequentially (minimise seeking).
+    let mut sorted_indices: Vec<(usize, u32)> = id_map
+        .iter()
+        .enumerate()
+        .map(|(shard_idx, &global_id)| (shard_idx, global_id))
+        .collect();
+    sorted_indices.sort_unstable_by_key(|&(_, gid)| gid);
+
+    let mut current_pos = 8u64; // right after header
+    for &(shard_idx, global_id) in &sorted_indices {
+        let target_pos = 8 + (global_id as u64) * (row_bytes as u64);
+        if target_pos != current_pos {
+            Seek::seek(&mut reader, SeekFrom::Start(target_pos))?;
+        }
+        Read::read_exact(&mut reader, &mut row_buf)?;
+        let src: &[T] = bytemuck::cast_slice(&row_buf);
+        data[shard_idx * ndims..(shard_idx + 1) * ndims].copy_from_slice(src);
+        current_pos = target_pos + row_bytes as u64;
+    }
+
+    Ok(data)
 }
 
 /// Load data in its native type T without converting to f32.
@@ -1452,5 +1681,99 @@ mod pipnn_merged_tests {
             (ratio - 10.0).abs() < 0.01,
             "variable part should scale linearly, ratio={ratio}"
         );
+    }
+
+    /// Write a DiskANN .bin file with the given f32 data (npoints x ndims).
+    fn write_test_bin(
+        storage: &impl StorageWriteProvider,
+        path: &str,
+        data: &[f32],
+        npoints: usize,
+        ndims: usize,
+    ) {
+        use diskann_utils::io::Metadata;
+        use std::io::Write;
+
+        let mut w = storage.create_for_write(path).unwrap();
+        let meta = Metadata::new(npoints, ndims).unwrap();
+        meta.write(&mut w).unwrap();
+        w.write_all(bytemuck::cast_slice::<f32, u8>(data)).unwrap();
+    }
+
+    #[test]
+    fn test_gather_shard_data_basic() {
+        let storage = diskann_providers::storage::VirtualStorageProvider::new_memory();
+        let ndims = 3;
+        let npoints = 5;
+        // 5 points, 3 dims: point i has values [i*10+1, i*10+2, i*10+3]
+        let data: Vec<f32> = (0..npoints)
+            .flat_map(|i| {
+                let base = (i * 10) as f32;
+                vec![base + 1.0, base + 2.0, base + 3.0]
+            })
+            .collect();
+        write_test_bin(&storage, "/test.bin", &data, npoints, ndims);
+
+        // Gather points 3, 0, 4 (out of order).
+        let id_map = vec![3u32, 0, 4];
+        let result = gather_shard_data::<f32, _>("/test.bin", &storage, &id_map, ndims).unwrap();
+
+        // result[0] should be point 3: [31, 32, 33]
+        assert_eq!(&result[0..3], &[31.0, 32.0, 33.0]);
+        // result[1] should be point 0: [1, 2, 3]
+        assert_eq!(&result[3..6], &[1.0, 2.0, 3.0]);
+        // result[2] should be point 4: [41, 42, 43]
+        assert_eq!(&result[6..9], &[41.0, 42.0, 43.0]);
+    }
+
+    #[test]
+    fn test_gather_shard_data_sequential() {
+        let storage = diskann_providers::storage::VirtualStorageProvider::new_memory();
+        let ndims = 2;
+        let npoints = 4;
+        let data: Vec<f32> = (0..npoints)
+            .flat_map(|i| vec![i as f32, (i * 100) as f32])
+            .collect();
+        write_test_bin(&storage, "/seq.bin", &data, npoints, ndims);
+
+        // Gather all points in order.
+        let id_map = vec![0u32, 1, 2, 3];
+        let result = gather_shard_data::<f32, _>("/seq.bin", &storage, &id_map, ndims).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_gather_shard_data_single_point() {
+        let storage = diskann_providers::storage::VirtualStorageProvider::new_memory();
+        let ndims = 4;
+        let npoints = 10;
+        let data: Vec<f32> = (0..npoints * ndims).map(|i| i as f32).collect();
+        write_test_bin(&storage, "/single.bin", &data, npoints, ndims);
+
+        let id_map = vec![7u32];
+        let result = gather_shard_data::<f32, _>("/single.bin", &storage, &id_map, ndims).unwrap();
+        // Point 7 starts at index 7*4=28
+        assert_eq!(&result[..], &data[28..32]);
+    }
+
+    #[test]
+    fn test_gather_shard_data_preserves_shard_order() {
+        // Ensure the output is in shard-local order (id_map order), not sorted order.
+        let storage = diskann_providers::storage::VirtualStorageProvider::new_memory();
+        let ndims = 2;
+        let npoints = 3;
+        let data: Vec<f32> = vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0];
+        write_test_bin(&storage, "/order.bin", &data, npoints, ndims);
+
+        // Request in reverse order: [2, 1, 0]
+        let id_map = vec![2u32, 1, 0];
+        let result = gather_shard_data::<f32, _>("/order.bin", &storage, &id_map, ndims).unwrap();
+
+        // Shard-local index 0 = global 2 = [30, 31]
+        assert_eq!(&result[0..2], &[30.0, 31.0]);
+        // Shard-local index 1 = global 1 = [20, 21]
+        assert_eq!(&result[2..4], &[20.0, 21.0]);
+        // Shard-local index 2 = global 0 = [10, 11]
+        assert_eq!(&result[4..6], &[10.0, 11.0]);
     }
 }

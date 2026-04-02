@@ -383,12 +383,12 @@ where
         Ok(())
     }
 
-    fn read_idmap(&self, idmaps_path: String) -> Result<Vec<u32>, diskann_utils::io::ReadBinError> {
+    pub(crate) fn read_idmap(&self, idmaps_path: String) -> Result<Vec<u32>, diskann_utils::io::ReadBinError> {
         let data = read_bin::<u32>(&mut self.storage_provider.open_reader(&idmaps_path)?)?;
         Ok(data.into_inner().into_vec())
     }
 
-    fn merge_shards_and_cleanup(
+    pub(crate) fn merge_shards_and_cleanup(
         &self,
         merged_index_prefix: &str,
         num_parts: usize,
