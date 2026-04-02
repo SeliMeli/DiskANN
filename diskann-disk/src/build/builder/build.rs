@@ -625,12 +625,25 @@ where
         let sampling_rate = 0.05; // 5% subsample for k-means
 
         let ram_budget = self.disk_build_param.build_memory_limit().in_bytes() as f64;
+        let num_threads = if config.num_threads > 0 {
+            config.num_threads
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        };
         let ram_estimator = |npoints: u64, dim: u64| -> f64 {
             let data = npoints as f64 * dim as f64 * type_size as f64;
             let reservoirs = npoints as f64 * config.l_max as f64 * 8.0;
             let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
-            let overhead = 150.0 * 1024.0 * 1024.0;
-            data + reservoirs + sketches + overhead
+            // Partition GEMM: each thread allocates stripe(4K) × dim × 4 (f32 point data)
+            // + stripe × num_leaders × 4 (dot products). This is the real peak.
+            let stripe = 4096.0f64;
+            let num_leaders = (npoints as f64 * config.p_samp).ceil().min(1000.0);
+            let partition_bufs =
+                num_threads as f64 * stripe * (dim as f64 * 4.0 + num_leaders * 4.0);
+            let overhead = 100.0 * 1024.0 * 1024.0;
+            data + reservoirs + sketches + partition_bufs + overhead
         };
 
         let mut rng = diskann_providers::utils::create_rnd_from_optional_seed(
