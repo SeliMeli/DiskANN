@@ -67,7 +67,7 @@ use crate::{
     DiskIndexBuildParameters, QuantizationType,
 };
 #[cfg(feature = "pipnn")]
-use crate::utils::partition_with_ram_budget;
+use crate::{disk_index_build_parameter::BYTES_IN_GB, utils::partition_with_ram_budget};
 
 /// Disk index builder that composes with DiskIndexBuilderCore.
 pub struct DiskIndexBuilder<'a, Data, StorageProvider>
@@ -380,8 +380,46 @@ where
 
     /// Fully synchronous PiPNN build: PQ compression + PiPNN graph + disk layout.
     /// Runs without tokio runtime, avoiding the ~1.6 GB async future overhead.
+    ///
+    /// When the estimated one-shot RAM exceeds the build memory budget, this
+    /// automatically routes to the merged shard path.
     #[cfg(feature = "pipnn")]
     fn build_sync_pipnn(&mut self) -> ANNResult<()> {
+        // Check if we need the merged shard path.
+        // Only applies to non-SQ1 (full precision) builds — SQ1 already compresses data.
+        if !matches!(&self.build_quantizer, BuildQuantizer::Scalar1Bit(_)) {
+            let config = self
+                .disk_build_param
+                .build_algorithm()
+                .to_pipnn_config(
+                    self.index_configuration.config.pruned_degree().get(),
+                    self.index_configuration.dist_metric,
+                    self.index_configuration.config.alpha(),
+                    self.index_configuration.num_threads,
+                )
+                .ok_or_else(|| {
+                    ANNError::log_index_error(
+                        "build_pipnn_index called but build algorithm is not PiPNN",
+                    )
+                })?;
+
+            let npoints = self.index_configuration.max_points;
+            let ndims = self.index_configuration.dim;
+            let type_size = std::mem::size_of::<Data::VectorDataType>();
+            let estimated =
+                estimate_pipnn_shard_ram(npoints as u64, ndims as u64, type_size, &config);
+            let budget = self.disk_build_param.build_memory_limit().in_bytes() as f64;
+
+            if estimated > budget {
+                info!(
+                    "PiPNN merged build: estimated {:.1} GB > budget {:.1} GB, using shard path",
+                    estimated / BYTES_IN_GB,
+                    budget / BYTES_IN_GB
+                );
+                return self.build_sync_pipnn_merged();
+            }
+        }
+
         let mut logger = PerfLogger::new_disk_index_build_logger();
         let pool = create_thread_pool(self.index_configuration.num_threads)?;
 
@@ -1775,5 +1813,59 @@ mod pipnn_merged_tests {
         assert_eq!(&result[2..4], &[20.0, 21.0]);
         // Shard-local index 2 = global 0 = [10, 11]
         assert_eq!(&result[4..6], &[10.0, 11.0]);
+    }
+
+    #[test]
+    fn test_routing_oneshot_when_budget_sufficient() {
+        // Enron 1M, fp16, 384d — estimated ~1.5 GB.
+        // With 32 GB budget, one-shot should be chosen.
+        let config = test_config(64, 14);
+        let estimated = estimate_pipnn_shard_ram(1_090_000, 384, 2, &config);
+        let budget = 32.0 * 1024.0 * 1024.0 * 1024.0; // 32 GB
+        assert!(
+            estimated <= budget,
+            "estimated {:.1} GB should fit in 32 GB budget",
+            estimated / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    #[test]
+    fn test_routing_merged_when_budget_exceeded() {
+        // Enron 1M, fp16, 384d — estimated ~1.5 GB.
+        // With 1 GB budget, merged should be chosen.
+        let config = test_config(64, 14);
+        let estimated = estimate_pipnn_shard_ram(1_090_000, 384, 2, &config);
+        let budget = 1.0 * 1024.0 * 1024.0 * 1024.0; // 1 GB
+        assert!(
+            estimated > budget,
+            "estimated {:.1} GB should exceed 1 GB budget",
+            estimated / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    #[test]
+    fn test_routing_merged_when_budget_tight() {
+        // 500K points, fp32 (4 bytes), 128d, l_max=128, 12 planes.
+        // data:       500K * 128 * 4 = 256 MB
+        // reservoirs: 500K * 128 * 8 = 512 MB
+        // sketches:   500K * 12 * 4  =  24 MB
+        // overhead:                     150 MB
+        // total:                       ~942 MB
+        let config = test_config(128, 12);
+        let estimated = estimate_pipnn_shard_ram(500_000, 128, 4, &config);
+        // 942 MB should exceed a 900 MB budget
+        let budget = 900.0 * 1024.0 * 1024.0;
+        assert!(
+            estimated > budget,
+            "estimated {:.1} MB should exceed 900 MB budget",
+            estimated / (1024.0 * 1024.0)
+        );
+        // But should fit in a 1 GB budget
+        let budget_1g = 1024.0 * 1024.0 * 1024.0;
+        assert!(
+            estimated < budget_1g,
+            "estimated {:.1} MB should fit in 1 GB budget",
+            estimated / (1024.0 * 1024.0)
+        );
     }
 }
