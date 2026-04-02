@@ -378,8 +378,20 @@ where
     /// automatically routes to the merged shard path.
     #[cfg(feature = "pipnn")]
     fn build_sync_pipnn(&mut self) -> ANNResult<()> {
+        let mut logger = PerfLogger::new_disk_index_build_logger();
+        let pool = create_thread_pool(self.index_configuration.num_threads)?;
+
+        // PQ compression (shared by both one-shot and merged paths).
+        let t_pq = std::time::Instant::now();
+        {
+            let runtime = create_runtime(self.index_configuration.num_threads)?;
+            runtime.block_on(self.generate_compressed_data(&pool))?;
+        }
+        logger.log_checkpoint(DiskIndexBuildCheckpoint::PqConstruction);
+        let pq_secs = t_pq.elapsed().as_secs_f64();
+
         // Check if we need the merged shard path.
-        // Only applies to non-SQ1 (full precision) builds — SQ1 already compresses data.
+        // Only applies to non-SQ1 builds — SQ1 already compresses data.
         if !matches!(&self.build_quantizer, BuildQuantizer::Scalar1Bit(_)) {
             let config = self
                 .disk_build_param
@@ -399,8 +411,10 @@ where
             let npoints = self.index_configuration.max_points;
             let ndims = self.index_configuration.dim;
             let type_size = std::mem::size_of::<Data::VectorDataType>();
-            let estimated =
-                estimate_pipnn_shard_ram(npoints as u64, ndims as u64, type_size, &config);
+            let num_threads = self.index_configuration.num_threads;
+            let estimated = estimate_pipnn_shard_ram(
+                npoints as u64, ndims as u64, type_size, num_threads, &config,
+            );
             let budget = self.disk_build_param.build_memory_limit().in_bytes() as f64;
 
             if estimated > budget {
@@ -409,13 +423,11 @@ where
                     estimated / BYTES_IN_GB,
                     budget / BYTES_IN_GB
                 );
-                return self.build_sync_pipnn_merged();
+                return self.build_sync_pipnn_merged(logger, pool, config, pq_secs);
             }
         }
 
-        let mut logger = PerfLogger::new_disk_index_build_logger();
-        let pool = create_thread_pool(self.index_configuration.num_threads)?;
-
+        // One-shot path.
         info!(
             "Starting PiPNN build (sync): R={} L={} T={}",
             self.index_configuration.config.pruned_degree(),
@@ -423,22 +435,10 @@ where
             self.index_configuration.num_threads
         );
 
-        // PQ compression (sync — generate_compressed_data has no .await calls).
-        let t_pq = std::time::Instant::now();
-        {
-            let runtime = create_runtime(self.index_configuration.num_threads)?;
-            runtime.block_on(self.generate_compressed_data(&pool))?;
-        }
-        // Runtime dropped — reclaim RSS from PQ phase before PiPNN starts.
-        logger.log_checkpoint(DiskIndexBuildCheckpoint::PqConstruction);
-        let pq_secs = t_pq.elapsed().as_secs_f64();
-
-        // PiPNN graph build (pure rayon, no tokio).
         let t_index = std::time::Instant::now();
         self.build_pipnn_index_sync()?;
         logger.log_checkpoint(DiskIndexBuildCheckpoint::InmemIndexBuild);
         let index_secs = t_index.elapsed().as_secs_f64();
-
 
         let t_layout = std::time::Instant::now();
         self.create_disk_layout()?;
@@ -552,44 +552,28 @@ where
 
     /// PiPNN merged shard build for datasets that exceed the RAM budget.
     ///
+    /// Called from `build_sync_pipnn` after PQ compression and config construction.
     /// Same pattern as `build_merged_vamana_index`:
     /// 1. `partition_with_ram_budget` -- K overlapping shards via streaming k-means
     /// 2. For each shard: gather data by ID map, `build_typed`, save graph, drop
     /// 3. `merge_shards` -- combine per-shard graphs into a single unified graph
     /// 4. Disk layout
     #[cfg(feature = "pipnn")]
-    fn build_sync_pipnn_merged(&mut self) -> ANNResult<()> {
+    fn build_sync_pipnn_merged(
+        &mut self,
+        mut logger: PerfLogger,
+        pool: RayonThreadPool,
+        config: diskann_pipnn::PiPNNConfig,
+        pq_secs: f64,
+    ) -> ANNResult<()> {
         use diskann_pipnn::builder;
-
-        let mut logger = PerfLogger::new_disk_index_build_logger();
-        let pool = create_thread_pool(self.index_configuration.num_threads)?;
-
-        // PQ compression first (same as one-shot).
-        let t_pq = std::time::Instant::now();
-        {
-            let runtime = create_runtime(self.index_configuration.num_threads)?;
-            runtime.block_on(self.generate_compressed_data(&pool))?;
-        }
-        logger.log_checkpoint(DiskIndexBuildCheckpoint::PqConstruction);
-        let pq_secs = t_pq.elapsed().as_secs_f64();
-
-        // Build PiPNN config from build parameters.
-        let config = self
-            .disk_build_param
-            .build_algorithm()
-            .to_pipnn_config(
-                self.index_configuration.config.pruned_degree().get(),
-                self.index_configuration.dist_metric,
-                self.index_configuration.config.alpha(),
-                self.index_configuration.num_threads,
-            )
-            .ok_or_else(|| ANNError::log_index_error("not PiPNN"))?;
 
         let data_path = self.index_writer.get_dataset_file();
         let merged_index_prefix = self.index_writer.get_merged_index_prefix();
         let max_degree = self.index_configuration.config.pruned_degree_u32().get();
         let ndims = self.index_configuration.dim;
         let type_size = std::mem::size_of::<Data::VectorDataType>();
+        let num_threads = self.index_configuration.num_threads;
 
         // Phase 1: Partition into overlapping shards.
         let t_part = std::time::Instant::now();
@@ -597,32 +581,15 @@ where
         let sampling_rate = 0.05; // 5% subsample for k-means
 
         // Reserve space for PQ compressed data which stays resident from the PQ phase.
-        // PQ compressed = npoints × num_pq_chunks bytes. Estimate conservatively as
-        // npoints × ndims/2 (common PQ chunk count is ndims/2).
-        let pq_resident = self.index_configuration.max_points as f64
-            * (ndims as f64 / 2.0).min(192.0);
+        let pq_chunks = self.disk_build_param.search_pq_chunks().get() as f64;
+        let pq_resident = self.index_configuration.max_points as f64 * pq_chunks;
         let ram_budget = (self.disk_build_param.build_memory_limit().in_bytes() as f64
             - pq_resident)
             .max(256.0 * 1024.0 * 1024.0); // floor at 256 MB
-        let num_threads = if config.num_threads > 0 {
-            config.num_threads
-        } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        };
+
+        // Same estimator as the routing check — single formula for consistency.
         let ram_estimator = |npoints: u64, dim: u64| -> f64 {
-            let data = npoints as f64 * dim as f64 * type_size as f64;
-            let reservoirs = npoints as f64 * config.l_max as f64 * 8.0;
-            let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
-            // Partition GEMM: each rayon thread allocates stripe × dim × 4 (f32 point data)
-            // + stripe × num_leaders × 4 (dot products). Conservative: assume all threads active.
-            let stripe = 4096.0f64;
-            let num_leaders = (npoints as f64 * config.p_samp).ceil().min(1000.0);
-            let partition_bufs =
-                num_threads as f64 * stripe * (dim as f64 * 4.0 + num_leaders * 4.0);
-            let overhead = 100.0 * 1024.0 * 1024.0;
-            data + reservoirs + sketches + partition_bufs + overhead
+            estimate_pipnn_shard_ram(npoints, dim, type_size, num_threads, &config)
         };
 
         let mut rng = diskann_providers::utils::create_rnd_from_optional_seed(
@@ -894,29 +861,31 @@ where
     }
 }
 
-/// Estimate peak RAM (in bytes) for a PiPNN one-shot build on `npoints` vectors
-/// of `ndims` dimensions with element size `type_size` bytes.
+/// Estimate peak RAM (in bytes) for a PiPNN build on `npoints` vectors.
 ///
-/// Used by `partition_with_ram_budget` (as a closure) to find the right shard count,
-/// and by the routing logic to decide one-shot vs merged.
+/// Used by both the routing logic (one-shot vs merged) and `partition_with_ram_budget`
+/// (as a closure) to size shards. Single formula for consistency.
 ///
-/// Components:
-/// - data:       npoints * ndims * type_size
-/// - reservoirs: npoints * l_max * 8  (each reservoir entry is a (u32,f32) pair)
-/// - sketches:   npoints * num_hash_planes * 4  (one f32 per plane per point)
-/// - overhead:   150 MB (partition buffers, leaf GEMM buffers, allocator fragmentation)
+/// Components: data + reservoirs + sketches + partition GEMM buffers + overhead.
 #[cfg(feature = "pipnn")]
 fn estimate_pipnn_shard_ram(
     npoints: u64,
     ndims: u64,
     type_size: usize,
+    num_threads: usize,
     config: &diskann_pipnn::PiPNNConfig,
 ) -> f64 {
     let data = npoints as f64 * ndims as f64 * type_size as f64;
     let reservoirs = npoints as f64 * config.l_max as f64 * 8.0;
     let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
-    let overhead = 150.0 * 1024.0 * 1024.0;
-    data + reservoirs + sketches + overhead
+    // Partition GEMM: each rayon thread allocates a stripe of point data (f32)
+    // + dot product buffer (stripe × num_leaders).
+    let stripe = 4096.0f64;
+    let num_leaders = (npoints as f64 * config.p_samp).ceil().min(1000.0);
+    let partition_bufs =
+        num_threads as f64 * stripe * (ndims as f64 * 4.0 + num_leaders * 4.0);
+    let overhead = 100.0 * 1024.0 * 1024.0;
+    data + reservoirs + sketches + partition_bufs + overhead
 }
 
 /// Read a subset of vectors from a DiskANN `.bin` file by their global IDs.
@@ -1664,7 +1633,7 @@ mod pipnn_merged_tests {
         // Enron 1M, fp16 (2 bytes), 384d, l_max=64, 14 planes
         // With K=4 shards, k_base=2: shard_npts ~544K
         let config = test_config(64, 14);
-        let est = estimate_pipnn_shard_ram(544_000, 384, 2, &config);
+        let est = estimate_pipnn_shard_ram(544_000, 384, 2, 1, &config);
         // Should be < 1 GB but > 500 MB
         assert!(
             est < 1.0 * 1024.0 * 1024.0 * 1024.0,
@@ -1685,14 +1654,19 @@ mod pipnn_merged_tests {
         let npoints = 100_000u64;
         let ndims = 384u64;
         let type_size = 2usize; // fp16
+        let num_threads = 1usize;
 
-        let est = estimate_pipnn_shard_ram(npoints, ndims, type_size, &config);
+        let est = estimate_pipnn_shard_ram(npoints, ndims, type_size, num_threads, &config);
 
         let data = npoints as f64 * ndims as f64 * type_size as f64;
         let reservoirs = npoints as f64 * 64.0 * 8.0;
         let sketches = npoints as f64 * 14.0 * 4.0;
-        let overhead = 150.0 * 1024.0 * 1024.0;
-        let expected = data + reservoirs + sketches + overhead;
+        let stripe = 4096.0f64;
+        let num_leaders = (npoints as f64 * config.p_samp).ceil().min(1000.0);
+        let partition_bufs =
+            num_threads as f64 * stripe * (ndims as f64 * 4.0 + num_leaders * 4.0);
+        let overhead = 100.0 * 1024.0 * 1024.0;
+        let expected = data + reservoirs + sketches + partition_bufs + overhead;
 
         assert!(
             (est - expected).abs() < 1.0,
@@ -1703,17 +1677,20 @@ mod pipnn_merged_tests {
     #[test]
     fn test_pipnn_shard_ram_scales_with_points() {
         let config = test_config(64, 14);
-        let est_small = estimate_pipnn_shard_ram(100_000, 384, 2, &config);
-        let est_large = estimate_pipnn_shard_ram(1_000_000, 384, 2, &config);
+        let est_small = estimate_pipnn_shard_ram(100_000, 384, 2, 1, &config);
+        let est_large = estimate_pipnn_shard_ram(1_000_000, 384, 2, 1, &config);
         assert!(
             est_large > est_small,
             "larger dataset should need more RAM"
         );
-        // The overhead is constant, so 10x points should give roughly (but not exactly) 10x
-        let ratio = (est_large - 150.0 * 1024.0 * 1024.0) / (est_small - 150.0 * 1024.0 * 1024.0);
+        // Variable part should scale roughly linearly (overhead is constant).
+        let overhead = 100.0 * 1024.0 * 1024.0;
+        let ratio = (est_large - overhead) / (est_small - overhead);
+        // partition_bufs includes num_leaders which scales with npoints via p_samp
+        // (capped at 1000), so the ratio is close to but not exactly 10.
         assert!(
-            (ratio - 10.0).abs() < 0.01,
-            "variable part should scale linearly, ratio={ratio}"
+            (9.0..11.0).contains(&ratio),
+            "variable part should scale roughly linearly, ratio={ratio}"
         );
     }
 
@@ -1816,7 +1793,7 @@ mod pipnn_merged_tests {
         // Enron 1M, fp16, 384d — estimated ~1.5 GB.
         // With 32 GB budget, one-shot should be chosen.
         let config = test_config(64, 14);
-        let estimated = estimate_pipnn_shard_ram(1_090_000, 384, 2, &config);
+        let estimated = estimate_pipnn_shard_ram(1_090_000, 384, 2, 1, &config);
         let budget = 32.0 * 1024.0 * 1024.0 * 1024.0; // 32 GB
         assert!(
             estimated <= budget,
@@ -1830,7 +1807,7 @@ mod pipnn_merged_tests {
         // Enron 1M, fp16, 384d — estimated ~1.5 GB.
         // With 1 GB budget, merged should be chosen.
         let config = test_config(64, 14);
-        let estimated = estimate_pipnn_shard_ram(1_090_000, 384, 2, &config);
+        let estimated = estimate_pipnn_shard_ram(1_090_000, 384, 2, 1, &config);
         let budget = 1.0 * 1024.0 * 1024.0 * 1024.0; // 1 GB
         assert!(
             estimated > budget,
@@ -1841,16 +1818,12 @@ mod pipnn_merged_tests {
 
     #[test]
     fn test_routing_merged_when_budget_tight() {
-        // 500K points, fp32 (4 bytes), 128d, l_max=128, 12 planes.
-        // data:       500K * 128 * 4 = 256 MB
-        // reservoirs: 500K * 128 * 8 = 512 MB
-        // sketches:   500K * 12 * 4  =  24 MB
-        // overhead:                     150 MB
-        // total:                       ~942 MB
+        // 500K points, fp32 (4 bytes), 128d, l_max=128, 12 planes, 1 thread.
+        // data + reservoirs + sketches + partition_bufs + overhead ≈ 873 MB
         let config = test_config(128, 12);
-        let estimated = estimate_pipnn_shard_ram(500_000, 128, 4, &config);
-        // 942 MB should exceed a 900 MB budget
-        let budget = 900.0 * 1024.0 * 1024.0;
+        let estimated = estimate_pipnn_shard_ram(500_000, 128, 4, 1, &config);
+        // Should exceed an 800 MB budget
+        let budget = 800.0 * 1024.0 * 1024.0;
         assert!(
             estimated > budget,
             "estimated {:.1} MB should exceed 900 MB budget",
