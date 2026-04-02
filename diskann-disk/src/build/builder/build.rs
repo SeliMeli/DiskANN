@@ -624,7 +624,14 @@ where
         let k_base = 2; // each point appears in 2 shards
         let sampling_rate = 0.05; // 5% subsample for k-means
 
-        let ram_budget = self.disk_build_param.build_memory_limit().in_bytes() as f64;
+        // Reserve space for PQ compressed data which stays resident from the PQ phase.
+        // PQ compressed = npoints × num_pq_chunks bytes. Estimate conservatively as
+        // npoints × ndims/2 (common PQ chunk count is ndims/2).
+        let pq_resident = self.index_configuration.max_points as f64
+            * (ndims as f64 / 2.0).min(192.0);
+        let ram_budget = (self.disk_build_param.build_memory_limit().in_bytes() as f64
+            - pq_resident)
+            .max(256.0 * 1024.0 * 1024.0); // floor at 256 MB
         let num_threads = if config.num_threads > 0 {
             config.num_threads
         } else {
