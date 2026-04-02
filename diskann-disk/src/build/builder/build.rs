@@ -695,17 +695,10 @@ where
                 ndims,
             )?;
 
-            let shard_est = ram_estimator(shard_npoints as u64, ndims as u64);
-            println!(
-                "  Shard {}/{}: {} pts, data={:.1} MB, est_ram={:.1} MB",
-                shard,
-                num_parts,
-                shard_npoints,
-                (shard_npoints * ndims * type_size) as f64 / (1024.0 * 1024.0),
-                shard_est / (1024.0 * 1024.0),
-            );
+            let gather_secs = t_shard.elapsed().as_secs_f64();
 
             // Build one-shot PiPNN on this shard.
+            let t_pipnn = std::time::Instant::now();
             let graph = builder::build_typed(&shard_data, shard_npoints, ndims, &config)
                 .map_err(|e| {
                     ANNError::log_index_error(format!("PiPNN shard {} build failed: {}", shard, e))
@@ -722,12 +715,11 @@ where
                     ANNError::log_index_error(format!("PiPNN shard {} save failed: {}", shard, e))
                 })?;
 
-            info!(
-                "Shard {}/{}: built in {:.3}s (avg_degree={:.1})",
-                shard,
-                num_parts,
-                t_shard.elapsed().as_secs_f64(),
-                graph.avg_degree()
+            let pipnn_secs = t_pipnn.elapsed().as_secs_f64();
+            println!(
+                "  Shard {}/{}: {} pts, gather={:.2}s, build={:.2}s, total={:.2}s",
+                shard, num_parts, shard_npoints,
+                gather_secs, pipnn_secs, t_shard.elapsed().as_secs_f64(),
             );
 
             // Shard data + graph dropped here -- memory freed.
