@@ -685,6 +685,31 @@ where
     }
 }
 
+/// Estimate peak RAM (in bytes) for a PiPNN one-shot build on `npoints` vectors
+/// of `ndims` dimensions with element size `type_size` bytes.
+///
+/// Used by `partition_with_ram_budget` (as a closure) to find the right shard count,
+/// and by the routing logic to decide one-shot vs merged.
+///
+/// Components:
+/// - data:       npoints * ndims * type_size
+/// - reservoirs: npoints * l_max * 8  (each reservoir entry is a (u32,f32) pair)
+/// - sketches:   npoints * num_hash_planes * 4  (one f32 per plane per point)
+/// - overhead:   150 MB (partition buffers, leaf GEMM buffers, allocator fragmentation)
+#[cfg(feature = "pipnn")]
+fn estimate_pipnn_shard_ram(
+    npoints: u64,
+    ndims: u64,
+    type_size: usize,
+    config: &diskann_pipnn::PiPNNConfig,
+) -> f64 {
+    let data = npoints as f64 * ndims as f64 * type_size as f64;
+    let reservoirs = npoints as f64 * config.l_max as f64 * 8.0;
+    let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
+    let overhead = 150.0 * 1024.0 * 1024.0;
+    data + reservoirs + sketches + overhead
+}
+
 /// Load data in its native type T without converting to f32.
 #[cfg(feature = "pipnn")]
 fn load_data_typed<T, SP>(
@@ -1342,6 +1367,90 @@ mod start_point_tests {
         assert_eq!(
             result.err().unwrap().kind(),
             ANNErrorKind::InvalidFileFormatError
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "pipnn")]
+mod pipnn_merged_tests {
+    use super::*;
+    use diskann_vector::distance::Metric;
+
+    /// Helper to create a PiPNNConfig for tests.
+    fn test_config(l_max: usize, num_hash_planes: usize) -> diskann_pipnn::PiPNNConfig {
+        diskann_pipnn::PiPNNConfig {
+            num_hash_planes,
+            c_max: 1024,
+            c_min: 256,
+            p_samp: 0.005,
+            fanout: vec![10, 3],
+            k: 2,
+            max_degree: 64,
+            replicas: 1,
+            l_max,
+            metric: Metric::CosineNormalized,
+            final_prune: false,
+            alpha: 1.2,
+            num_threads: 1,
+        }
+    }
+
+    #[test]
+    fn test_pipnn_shard_ram_estimate_enron() {
+        // Enron 1M, fp16 (2 bytes), 384d, l_max=64, 14 planes
+        // With K=4 shards, k_base=2: shard_npts ~544K
+        let config = test_config(64, 14);
+        let est = estimate_pipnn_shard_ram(544_000, 384, 2, &config);
+        // Should be < 1 GB but > 500 MB
+        assert!(
+            est < 1.0 * 1024.0 * 1024.0 * 1024.0,
+            "estimated {:.1} MB should be < 1 GB",
+            est / (1024.0 * 1024.0)
+        );
+        assert!(
+            est > 500.0 * 1024.0 * 1024.0,
+            "estimated {:.1} MB should be > 500 MB",
+            est / (1024.0 * 1024.0)
+        );
+    }
+
+    #[test]
+    fn test_pipnn_shard_ram_estimate_components() {
+        // Verify each component contributes correctly.
+        let config = test_config(64, 14);
+        let npoints = 100_000u64;
+        let ndims = 384u64;
+        let type_size = 2usize; // fp16
+
+        let est = estimate_pipnn_shard_ram(npoints, ndims, type_size, &config);
+
+        let data = npoints as f64 * ndims as f64 * type_size as f64;
+        let reservoirs = npoints as f64 * 64.0 * 8.0;
+        let sketches = npoints as f64 * 14.0 * 4.0;
+        let overhead = 150.0 * 1024.0 * 1024.0;
+        let expected = data + reservoirs + sketches + overhead;
+
+        assert!(
+            (est - expected).abs() < 1.0,
+            "estimate {est} should match manual calc {expected}"
+        );
+    }
+
+    #[test]
+    fn test_pipnn_shard_ram_scales_with_points() {
+        let config = test_config(64, 14);
+        let est_small = estimate_pipnn_shard_ram(100_000, 384, 2, &config);
+        let est_large = estimate_pipnn_shard_ram(1_000_000, 384, 2, &config);
+        assert!(
+            est_large > est_small,
+            "larger dataset should need more RAM"
+        );
+        // The overhead is constant, so 10x points should give roughly (but not exactly) 10x
+        let ratio = (est_large - 150.0 * 1024.0 * 1024.0) / (est_small - 150.0 * 1024.0 * 1024.0);
+        assert!(
+            (ratio - 10.0).abs() < 0.01,
+            "variable part should scale linearly, ratio={ratio}"
         );
     }
 }
