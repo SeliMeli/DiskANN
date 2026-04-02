@@ -39,6 +39,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 scopeguard = { version = "1.2", optional = true }
 diskann-benchmark-core = { workspace = true, features = ["bigann"] }
 itertools.workspace = true
+dhat = { version = "0.3", optional = true }
 
 [lints]
 clippy.undocumented_unsafe_blocks = "warn"
@@ -63,6 +64,9 @@ scalar-quantization = []
 
 # Enable minmax-quantization based algorithms
 minmax-quantization = []
+
+# Enable dhat heap profiling
+dhat-heap = ["dep:dhat"]
 
 # Enable Disk Index benchmarks
 disk-index = [
