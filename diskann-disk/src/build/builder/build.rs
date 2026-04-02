@@ -615,12 +615,14 @@ where
             let data = npoints as f64 * dim as f64 * type_size as f64;
             let reservoirs = npoints as f64 * config.l_max as f64 * 8.0;
             let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
-            // Leaf buffers: num_threads × c_max² × 4 (distance matrix, largest per-thread alloc).
-            // Partition GEMM stripes are smaller and transient.
-            let leaf_bufs = num_threads as f64
-                * (config.c_max as f64 * config.c_max as f64 * 4.0);
-            let overhead = 50.0 * 1024.0 * 1024.0; // allocator fragmentation
-            data + reservoirs + sketches + leaf_bufs + overhead
+            // Partition GEMM: each rayon thread allocates stripe × dim × 4 (f32 point data)
+            // + stripe × num_leaders × 4 (dot products). Conservative: assume all threads active.
+            let stripe = 4096.0f64;
+            let num_leaders = (npoints as f64 * config.p_samp).ceil().min(1000.0);
+            let partition_bufs =
+                num_threads as f64 * stripe * (dim as f64 * 4.0 + num_leaders * 4.0);
+            let overhead = 100.0 * 1024.0 * 1024.0;
+            data + reservoirs + sketches + partition_bufs + overhead
         };
 
         let mut rng = diskann_providers::utils::create_rnd_from_optional_seed(
