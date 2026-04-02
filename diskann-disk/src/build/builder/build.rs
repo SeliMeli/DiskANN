@@ -675,12 +675,14 @@ where
                 ndims,
             )?;
 
-            info!(
-                "Shard {}/{}: {} points, {:.1} MB",
+            let shard_est = ram_estimator(shard_npoints as u64, ndims as u64);
+            println!(
+                "  Shard {}/{}: {} pts, data={:.1} MB, est_ram={:.1} MB",
                 shard,
                 num_parts,
                 shard_npoints,
-                (shard_npoints * ndims * type_size) as f64 / (1024.0 * 1024.0)
+                (shard_npoints * ndims * type_size) as f64 / (1024.0 * 1024.0),
+                shard_est / (1024.0 * 1024.0),
             );
 
             // Build one-shot PiPNN on this shard.
