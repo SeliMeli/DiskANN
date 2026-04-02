@@ -260,13 +260,6 @@ where
         // Return freed memory (f32 data, graph, PiPNN internals) to the OS
         // before disk layout starts. Without this, ~1.7 GB of freed-but-retained
         // memory inflates peak RSS during the disk layout phase.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            extern "C" {
-                fn malloc_trim(pad: usize) -> i32;
-            }
-            malloc_trim(0);
-        }
 
         // Use physical file to pass the memory index to the disk writer
         let t_layout = std::time::Instant::now();
@@ -437,13 +430,6 @@ where
             runtime.block_on(self.generate_compressed_data(&pool))?;
         }
         // Runtime dropped — reclaim RSS from PQ phase before PiPNN starts.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            extern "C" {
-                fn malloc_trim(pad: usize) -> i32;
-            }
-            malloc_trim(0);
-        }
         logger.log_checkpoint(DiskIndexBuildCheckpoint::PqConstruction);
         let pq_secs = t_pq.elapsed().as_secs_f64();
 
@@ -453,13 +439,6 @@ where
         logger.log_checkpoint(DiskIndexBuildCheckpoint::InmemIndexBuild);
         let index_secs = t_index.elapsed().as_secs_f64();
 
-        #[cfg(target_os = "linux")]
-        unsafe {
-            extern "C" {
-                fn malloc_trim(pad: usize) -> i32;
-            }
-            malloc_trim(0);
-        }
 
         let t_layout = std::time::Instant::now();
         self.create_disk_layout()?;
@@ -591,13 +570,6 @@ where
             let runtime = create_runtime(self.index_configuration.num_threads)?;
             runtime.block_on(self.generate_compressed_data(&pool))?;
         }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            extern "C" {
-                fn malloc_trim(pad: usize) -> i32;
-            }
-            malloc_trim(0);
-        }
         logger.log_checkpoint(DiskIndexBuildCheckpoint::PqConstruction);
         let pq_secs = t_pq.elapsed().as_secs_f64();
 
@@ -721,13 +693,6 @@ where
             );
 
             // Shard data + graph dropped here -- memory freed.
-            #[cfg(target_os = "linux")]
-            unsafe {
-                extern "C" {
-                    fn malloc_trim(pad: usize) -> i32;
-                }
-                malloc_trim(0);
-            }
         }
         let build_secs = t_build.elapsed().as_secs_f64();
         logger.log_checkpoint(DiskIndexBuildCheckpoint::InmemIndexBuild);
