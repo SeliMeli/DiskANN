@@ -192,7 +192,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn merge_shards(
+    pub(crate) fn merge_shards(
         &self,
         merged_index_prefix: &str,
         num_parts: usize,

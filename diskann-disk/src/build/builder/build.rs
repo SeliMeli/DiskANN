@@ -720,9 +720,26 @@ where
         let build_secs = t_build.elapsed().as_secs_f64();
         logger.log_checkpoint(DiskIndexBuildCheckpoint::InmemIndexBuild);
 
-        // Phase 3: Merge shard graphs + cleanup temp files.
+        // Phase 3: Merge shard graphs.
         let t_merge = std::time::Instant::now();
-        self.merge_shards_and_cleanup(&merged_index_prefix, num_parts, max_degree, &mut rng)?;
+        let output_vamana = self.index_writer.get_mem_index_file();
+        self.merge_shards(
+            &merged_index_prefix,
+            num_parts,
+            max_degree,
+            output_vamana,
+            &mut rng,
+        )?;
+        // Cleanup: delete only the files PiPNN created (ID maps + shard graphs).
+        // Unlike Vamana, PiPNN doesn't create per-shard data files.
+        for p in 0..num_parts {
+            let shard_ids_file =
+                DiskIndexWriter::get_merged_index_subshard_id_map_file(&merged_index_prefix, p);
+            let shard_index_file =
+                DiskIndexWriter::get_merged_index_subshard_mem_index_file(&merged_index_prefix, p);
+            let _ = self.storage_provider.delete(&shard_ids_file);
+            let _ = self.storage_provider.delete(&shard_index_file);
+        }
         let merge_secs = t_merge.elapsed().as_secs_f64();
 
         // Phase 4: Disk layout.
