@@ -32,9 +32,10 @@ fn sample_num_leaders(n: usize, p_samp: f64) -> usize {
 }
 
 /// A leaf partition containing indices into the original dataset.
+/// Uses u32 indices to save ~1.47 GB on 10M-point datasets (vs. usize on 64-bit).
 #[derive(Debug, Clone)]
 pub struct Leaf {
-    pub indices: Vec<usize>,
+    pub indices: Vec<u32>,
 }
 
 /// Configuration for RBC partitioning.
@@ -304,7 +305,7 @@ fn force_split(indices: &[usize], c_max: usize) -> Vec<Leaf> {
     indices
         .chunks(c_max)
         .map(|chunk| Leaf {
-            indices: chunk.to_vec(),
+            indices: chunk.iter().map(|&i| i as u32).collect(),
         })
         .collect()
 }
@@ -495,7 +496,7 @@ pub fn partition<T: VectorRepr + Send + Sync>(
 
     if n <= config.c_max {
         return vec![Leaf {
-            indices: indices.to_vec(),
+            indices: indices.iter().map(|&i| i as u32).collect(),
         }];
     }
 
@@ -533,7 +534,9 @@ pub fn partition<T: VectorRepr + Send + Sync>(
     let mut leaves = Vec::new();
     for cluster in merged_clusters {
         if cluster.len() <= config.c_max {
-            leaves.push(Leaf { indices: cluster });
+            leaves.push(Leaf {
+                indices: cluster.iter().map(|&i| i as u32).collect(),
+            });
         } else {
             let sub_seed: u64 = rng.random();
             let mut sub_rng = rand::rngs::StdRng::seed_from_u64(sub_seed);
@@ -558,7 +561,7 @@ pub fn parallel_partition<T: VectorRepr + Send + Sync>(
 
     if n <= config.c_max {
         return vec![Leaf {
-            indices: indices.to_vec(),
+            indices: indices.iter().map(|&i| i as u32).collect(),
         }];
     }
 
@@ -627,7 +630,7 @@ pub fn parallel_partition<T: VectorRepr + Send + Sync>(
         .map(|(cluster, sub_seed)| {
             if cluster.len() <= config.c_max {
                 vec![Leaf {
-                    indices: cluster.clone(),
+                    indices: cluster.iter().map(|&i| i as u32).collect(),
                 }]
             } else {
                 let mut sub_rng = rand::rngs::StdRng::seed_from_u64(*sub_seed);
@@ -653,7 +656,7 @@ pub fn parallel_partition_quantized(
     let n = indices.len();
     if n <= config.c_max {
         return vec![Leaf {
-            indices: indices.to_vec(),
+            indices: indices.iter().map(|&i| i as u32).collect(),
         }];
     }
 
@@ -714,7 +717,7 @@ pub fn parallel_partition_quantized(
         .map(|(cluster, sub_seed)| {
             if cluster.len() <= config.c_max {
                 vec![Leaf {
-                    indices: cluster.clone(),
+                    indices: cluster.iter().map(|&i| i as u32).collect(),
                 }]
             } else {
                 let mut sub_rng = rand::rngs::StdRng::seed_from_u64(*sub_seed);
@@ -740,7 +743,7 @@ fn partition_quantized_recursive(
     let n = indices.len();
     if n <= config.c_max {
         return vec![Leaf {
-            indices: indices.to_vec(),
+            indices: indices.iter().map(|&i| i as u32).collect(),
         }];
     }
     if level >= MAX_DEPTH {
@@ -772,7 +775,9 @@ fn partition_quantized_recursive(
     let mut leaves = Vec::new();
     for cluster in merged {
         if cluster.len() <= config.c_max {
-            leaves.push(Leaf { indices: cluster });
+            leaves.push(Leaf {
+                indices: cluster.iter().map(|&i| i as u32).collect(),
+            });
         } else {
             let sub_seed: u64 = rng.random();
             let mut sub_rng = rand::rngs::StdRng::seed_from_u64(sub_seed);
@@ -1195,7 +1200,7 @@ mod tests {
             );
             // All indices should be valid.
             for &idx in &leaf.indices {
-                assert!(idx < npoints, "index {} out of range", idx);
+                assert!((idx as usize) < npoints, "index {} out of range", idx);
             }
         }
     }
@@ -1275,7 +1280,7 @@ mod tests {
         // Zero-norm vectors should appear in at least one leaf.
         let all_indices: std::collections::HashSet<usize> = leaves
             .iter()
-            .flat_map(|l| l.indices.iter().copied())
+            .flat_map(|l| l.indices.iter().map(|&i| i as usize))
             .collect();
         for i in 0..5 {
             assert!(

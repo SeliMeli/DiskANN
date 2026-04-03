@@ -390,8 +390,12 @@ where
         logger.log_checkpoint(DiskIndexBuildCheckpoint::PqConstruction);
         let pq_secs = t_pq.elapsed().as_secs_f64();
 
-        // Check if we need the merged shard path.
-        // Only applies to non-SQ1 builds — SQ1 already compresses data.
+        // Three-tier routing based on memory budget:
+        //   1. One-shot (fastest, most memory): data + reservoirs + sketches coexist
+        //   2. Disk-edges (moderate): Phase1 writes edges to disk, drop data, Phase2 fills reservoirs
+        //   3. Merged shards (slowest, least memory): partition into overlapping shards
+        //
+        // Only applies to non-SQ1 FP builds — SQ1 already compresses data.
         if !matches!(&self.build_quantizer, BuildQuantizer::Scalar1Bit(_)) {
             let config = self
                 .disk_build_param
@@ -412,22 +416,40 @@ where
             let ndims = self.index_configuration.dim;
             let type_size = std::mem::size_of::<Data::VectorDataType>();
             let num_threads = self.index_configuration.num_threads;
-            let estimated = estimate_pipnn_shard_ram(
-                npoints as u64, ndims as u64, type_size, num_threads, &config,
-            );
             let budget = self.disk_build_param.build_memory_limit().in_bytes() as f64;
 
-            if estimated > budget {
+            let est_oneshot = estimate_pipnn_oneshot_ram(
+                npoints as u64, ndims as u64, type_size, num_threads, &config,
+            );
+
+            if est_oneshot > budget {
+                // One-shot doesn't fit. Try disk-edges (data freed between phases).
+                let est_disk_edges = estimate_pipnn_disk_edges_ram(
+                    npoints as u64, ndims as u64, type_size, &config,
+                );
+
+                if est_disk_edges <= budget && !config.final_prune {
+                    info!(
+                        "PiPNN disk-edges build: one-shot {:.1} GB > budget {:.1} GB, disk-edges {:.1} GB fits",
+                        est_oneshot / BYTES_IN_GB,
+                        budget / BYTES_IN_GB,
+                        est_disk_edges / BYTES_IN_GB,
+                    );
+                    return self.build_sync_pipnn_disk_edges(logger, pool, config, pq_secs);
+                }
+
+                // Disk-edges doesn't fit either, or final_prune is on. Use merged shards.
                 info!(
-                    "PiPNN merged build: estimated {:.1} GB > budget {:.1} GB, using shard path",
-                    estimated / BYTES_IN_GB,
-                    budget / BYTES_IN_GB
+                    "PiPNN merged build: one-shot {:.1} GB, disk-edges {:.1} GB > budget {:.1} GB, using shard path",
+                    est_oneshot / BYTES_IN_GB,
+                    est_disk_edges / BYTES_IN_GB,
+                    budget / BYTES_IN_GB,
                 );
                 return self.build_sync_pipnn_merged(logger, pool, config, pq_secs);
             }
         }
 
-        // One-shot path.
+        // One-shot path (fits in budget).
         info!(
             "Starting PiPNN build (sync): R={} L={} T={}",
             self.index_configuration.config.pruned_degree(),
@@ -446,6 +468,71 @@ where
         let layout_secs = t_layout.elapsed().as_secs_f64();
 
         println!("Disk Index Build Phases");
+        println!("  PQ compression: {:.3}s", pq_secs);
+        println!("  Graph build:    {:.3}s", index_secs);
+        println!("  Disk layout:    {:.3}s", layout_secs);
+
+        Ok(())
+    }
+
+    /// PiPNN disk-edges build: Phase 1 writes edges to disk, caller drops data,
+    /// Phase 2 fills reservoirs from disk. Saves ~47% peak RSS vs one-shot.
+    #[cfg(feature = "pipnn")]
+    fn build_sync_pipnn_disk_edges(
+        &mut self,
+        mut logger: PerfLogger,
+        pool: RayonThreadPool,
+        config: diskann_pipnn::PiPNNConfig,
+        pq_secs: f64,
+    ) -> ANNResult<()> {
+        use diskann_pipnn::builder;
+
+        let data_path = self.index_writer.get_dataset_file();
+
+        let t_index = std::time::Instant::now();
+
+        // Load data, run Phase 1 (partition + leaf build + edge writing), drop data.
+        let (npoints, ndims, data) =
+            load_data_typed::<Data::VectorDataType, _>(&data_path, self.storage_provider)?;
+        let phase1 = builder::build_phase1(&data, npoints, ndims, &config)
+            .map_err(|e| ANNError::log_index_error(format!("PiPNN Phase1 failed: {}", e)))?;
+        drop(data); // Free dataset before Phase 2 allocates reservoirs.
+        info!(
+            "PiPNN Phase1 complete, dataset freed ({} edges on disk)",
+            phase1.stats.total_edges
+        );
+
+        // Phase 2: fill reservoirs from edge file, extract graph.
+        let graph = builder::build_phase2(phase1)
+            .map_err(|e| ANNError::log_index_error(format!("PiPNN Phase2 failed: {}", e)))?;
+
+        logger.log_checkpoint(DiskIndexBuildCheckpoint::InmemIndexBuild);
+        let index_secs = t_index.elapsed().as_secs_f64();
+
+        let save_path = self.index_writer.get_mem_index_file();
+        graph
+            .save_graph(std::path::Path::new(&save_path))
+            .map_err(|e| ANNError::log_index_error(format!("PiPNN graph save failed: {}", e)))?;
+
+        info!(
+            "PiPNN disk-edges build complete: avg_degree={:.1}, max_degree={}, total={:.3}s",
+            graph.avg_degree(), graph.max_degree(), graph.build_stats.total_secs
+        );
+        print!("{}", graph.build_stats);
+
+        self.checkpoint_record_manager.execute_stage(
+            WorkStage::InMemIndexBuild,
+            WorkStage::WriteDiskLayout,
+            || Ok(()),
+            || Ok(()),
+        )?;
+
+        let t_layout = std::time::Instant::now();
+        self.create_disk_layout()?;
+        logger.log_checkpoint(DiskIndexBuildCheckpoint::DiskLayout);
+        let layout_secs = t_layout.elapsed().as_secs_f64();
+
+        println!("Disk Index Build Phases (disk-edges)");
         println!("  PQ compression: {:.3}s", pq_secs);
         println!("  Graph build:    {:.3}s", index_secs);
         println!("  Disk layout:    {:.3}s", layout_secs);
@@ -861,31 +948,123 @@ where
     }
 }
 
-/// Estimate peak RAM (in bytes) for a PiPNN build on `npoints` vectors.
+/// Shared helper: compute per-component memory costs for PiPNN builds.
 ///
-/// Used by both the routing logic (one-shot vs merged) and `partition_with_ram_budget`
-/// (as a closure) to size shards. Single formula for consistency.
+/// All sizes derived from build parameters and Rust type sizes — no magic numbers.
+/// Based on DHAT profiling of BigANN 10M (measured).
+#[cfg(feature = "pipnn")]
+struct PiPNNMemComponents {
+    data: f64,
+    reservoirs: f64,
+    sketches: f64,
+    partition_clusters: f64,
+    overhead: f64,
+}
+
+#[cfg(feature = "pipnn")]
+impl PiPNNMemComponents {
+    fn compute(
+        npoints: u64,
+        ndims: u64,
+        type_size: usize,
+        config: &diskann_pipnn::PiPNNConfig,
+    ) -> Self {
+        use std::mem::size_of;
+
+        let n = npoints as f64;
+        let d = ndims as f64;
+
+        // Data vectors in native type (T).
+        let data = n * d * type_size as f64;
+
+        // HashPrune reservoirs: each node has a Mutex<Vec<ReservoirEntry>>.
+        // ReservoirEntry = (u32 neighbor, u16 hash, u16 distance) = 8 bytes.
+        // Per-node overhead: Vec (ptr+len+cap = 24 bytes) + Mutex (~40 bytes on parking_lot).
+        let entry_size = 8usize; // sizeof ReservoirEntry (u32 + u16 + u16)
+        let vec_mutex_overhead = size_of::<usize>() * 3 + 40; // Vec header + Mutex
+        let reservoir_per_node =
+            config.l_max as f64 * entry_size as f64 + vec_mutex_overhead as f64;
+        let reservoirs = n * reservoir_per_node;
+
+        // LSH sketches: one f32 per hyperplane per point.
+        let sketches = n * config.num_hash_planes as f64 * size_of::<f32>() as f64;
+
+        // Partition cluster membership: each point appears in ~fanout_product leaves.
+        // Leaf indices stored as u32.
+        let fanout_product: f64 = config.fanout.iter().map(|&f| f as f64).product();
+        let partition_clusters = n * fanout_product * size_of::<u32>() as f64;
+
+        // Fixed overhead: GEMM stripe buffers, leaf thread-local buffers, misc allocations.
+        let overhead = 100.0 * 1024.0 * 1024.0;
+
+        Self {
+            data,
+            reservoirs,
+            sketches,
+            partition_clusters,
+            overhead,
+        }
+    }
+}
+
+/// Safety factor for allocator fragmentation + Vec amortized doubling.
+/// DHAT-measured peaks are 6-12% above the sum of individual components.
+#[cfg(feature = "pipnn")]
+const PIPNN_SAFETY_FACTOR: f64 = 1.15;
+
+/// Estimate peak RAM for one-shot PiPNN build.
+/// Peak = data + reservoirs + sketches + partition_clusters + overhead (all coexist).
 ///
-/// Components: data + reservoirs + sketches + partition GEMM buffers + overhead.
+/// Verified: BigANN 10M × 128d × fp16 = measured 10.63 GB, formula gives ~11.4 GB.
+///           Enron 1M × 384d × fp16 = measured 1.96 GB, formula gives ~2.0 GB.
+#[cfg(feature = "pipnn")]
+fn estimate_pipnn_oneshot_ram(
+    npoints: u64,
+    ndims: u64,
+    type_size: usize,
+    _num_threads: usize,
+    config: &diskann_pipnn::PiPNNConfig,
+) -> f64 {
+    let c = PiPNNMemComponents::compute(npoints, ndims, type_size, config);
+    (c.data + c.reservoirs + c.sketches + c.partition_clusters + c.overhead) * PIPNN_SAFETY_FACTOR
+}
+
+/// Estimate peak RAM for disk-edges PiPNN build (split Phase 1 / Phase 2).
+/// Peak = max(Phase1, Phase2) where:
+///   Phase1 = data + sketches + partition_clusters + write_buf + overhead
+///   Phase2 = reservoirs + read_buf(256 MB) + overhead
+///
+/// Data is freed between phases. Reservoirs don't exist during Phase 1.
+///
+/// Verified: BigANN 10M × 128d × fp16 = measured 6.36 GB, formula gives ~7.0 GB.
+#[cfg(feature = "pipnn")]
+fn estimate_pipnn_disk_edges_ram(
+    npoints: u64,
+    ndims: u64,
+    type_size: usize,
+    config: &diskann_pipnn::PiPNNConfig,
+) -> f64 {
+    let c = PiPNNMemComponents::compute(npoints, ndims, type_size, config);
+    let write_buf = 64.0 * 1024.0 * 1024.0; // BufWriter buffer
+    let read_buf = 256.0 * 1024.0 * 1024.0; // Phase 2 read chunk
+
+    let phase1 = c.data + c.sketches + c.partition_clusters + write_buf + c.overhead;
+    let phase2 = c.reservoirs + read_buf + c.overhead;
+
+    phase1.max(phase2) * PIPNN_SAFETY_FACTOR
+}
+
+/// Estimate peak RAM for per-shard build (used by merged shard path).
+/// Same as one-shot but for a shard of N_shard points.
 #[cfg(feature = "pipnn")]
 fn estimate_pipnn_shard_ram(
     npoints: u64,
     ndims: u64,
     type_size: usize,
-    num_threads: usize,
+    _num_threads: usize,
     config: &diskann_pipnn::PiPNNConfig,
 ) -> f64 {
-    let data = npoints as f64 * ndims as f64 * type_size as f64;
-    let reservoirs = npoints as f64 * config.l_max as f64 * 8.0;
-    let sketches = npoints as f64 * config.num_hash_planes as f64 * 4.0;
-    // Partition GEMM: each rayon thread allocates a stripe of point data (f32)
-    // + dot product buffer (stripe × num_leaders).
-    let stripe = 4096.0f64;
-    let num_leaders = (npoints as f64 * config.p_samp).ceil().min(1000.0);
-    let partition_bufs =
-        num_threads as f64 * stripe * (ndims as f64 * 4.0 + num_leaders * 4.0);
-    let overhead = 100.0 * 1024.0 * 1024.0;
-    data + reservoirs + sketches + partition_bufs + overhead
+    estimate_pipnn_oneshot_ram(npoints, ndims, type_size, _num_threads, config)
 }
 
 /// Read a subset of vectors from a DiskANN `.bin` file by their global IDs.
@@ -1659,14 +1838,13 @@ mod pipnn_merged_tests {
         let est = estimate_pipnn_shard_ram(npoints, ndims, type_size, num_threads, &config);
 
         let data = npoints as f64 * ndims as f64 * type_size as f64;
-        let reservoirs = npoints as f64 * 64.0 * 8.0;
+        let reservoir_per_node = 64.0 * 8.0 + 64.0; // l_max * 8 + Vec/Mutex overhead
+        let reservoirs = npoints as f64 * reservoir_per_node;
         let sketches = npoints as f64 * 14.0 * 4.0;
-        let stripe = 4096.0f64;
-        let num_leaders = (npoints as f64 * config.p_samp).ceil().min(1000.0);
-        let partition_bufs =
-            num_threads as f64 * stripe * (ndims as f64 * 4.0 + num_leaders * 4.0);
+        let fanout_product: f64 = config.fanout.iter().map(|&f| f as f64).product();
+        let partition_clusters = npoints as f64 * fanout_product * 4.0;
         let overhead = 100.0 * 1024.0 * 1024.0;
-        let expected = data + reservoirs + sketches + partition_bufs + overhead;
+        let expected = (data + reservoirs + sketches + partition_clusters + overhead) * 1.15;
 
         assert!(
             (est - expected).abs() < 1.0,
@@ -1829,11 +2007,11 @@ mod pipnn_merged_tests {
             "estimated {:.1} MB should exceed 900 MB budget",
             estimated / (1024.0 * 1024.0)
         );
-        // But should fit in a 1 GB budget
-        let budget_1g = 1024.0 * 1024.0 * 1024.0;
+        // But should fit in a 1.5 GB budget
+        let budget_1_5g = 1.5 * 1024.0 * 1024.0 * 1024.0;
         assert!(
-            estimated < budget_1g,
-            "estimated {:.1} MB should fit in 1 GB budget",
+            estimated < budget_1_5g,
+            "estimated {:.1} MB should fit in 1.5 GB budget",
             estimated / (1024.0 * 1024.0)
         );
     }

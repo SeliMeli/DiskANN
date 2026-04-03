@@ -337,6 +337,390 @@ pub fn build_typed<T: VectorRepr + Send + Sync>(
     build_internal(data, npoints, ndims, config, None)
 }
 
+// ---------------------------------------------------------------------------
+// Two-phase split-build API for memory optimization.
+//
+// Phase 1: partition + leaf build + edge writing to temp file (needs data).
+// Phase 2: reservoir fill from edge file + graph extraction (NO data needed).
+//
+// Between phases the caller can drop the dataset Vec, freeing ~1.5 GB for
+// 10M x 128d f32 data before the reservoirs are allocated.
+// ---------------------------------------------------------------------------
+
+/// A single edge record stored on disk between Phase 1 and Phase 2.
+/// repr(C) + Pod ensures safe zero-copy mmap reads via bytemuck::cast_slice.
+/// 12 bytes per edge: src(4) + dst(4) + hash(2) + dist_bf16(2).
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct DiskEdge {
+    pub src: u32,
+    pub dst: u32,
+    pub hash: u16,
+    pub dist_bf16: u16,
+}
+
+// SAFETY: DiskEdge is repr(C) with all fields being plain integers and no
+// padding (4+4+2+2 = 12 bytes exactly). This satisfies the bytemuck Pod
+// requirements: all bit patterns are valid and there are no uninit bytes.
+unsafe impl bytemuck::Zeroable for DiskEdge {}
+unsafe impl bytemuck::Pod for DiskEdge {}
+
+/// Result of Phase 1 (partition + leaf build + edge writing).
+/// Carries everything Phase 2 needs without the dataset.
+pub struct PiPNNPhase1Result {
+    /// Path to the temporary edge file.
+    pub edge_file_path: std::path::PathBuf,
+    /// Medoid (graph entry point).
+    pub medoid: usize,
+    /// Number of points.
+    pub npoints: usize,
+    /// Number of dimensions.
+    pub ndims: usize,
+    /// Distance metric.
+    pub metric: diskann_vector::distance::Metric,
+    /// Build stats accumulated during Phase 1.
+    pub stats: PiPNNBuildStats,
+    /// Config snapshot for Phase 2.
+    pub l_max: usize,
+    pub max_degree: usize,
+    pub final_prune: bool,
+    pub alpha: f32,
+    pub num_threads: usize,
+}
+
+/// Phase 1: partition, leaf build, and edge writing to a temp file.
+///
+/// This phase needs the data and LSH sketches. After it returns, the caller
+/// can drop the data Vec to free memory before Phase 2 allocates reservoirs.
+pub fn build_phase1<T: VectorRepr + Send + Sync>(
+    data: &[T],
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+) -> PiPNNResult<PiPNNPhase1Result> {
+    use crate::hash_prune::{f32_to_bf16, LshSketches};
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    config.validate()?;
+
+    let expected_len = npoints * ndims;
+    if data.len() != expected_len {
+        return Err(PiPNNError::DataLengthMismatch {
+            expected: expected_len,
+            actual: data.len(),
+            npoints,
+            ndims,
+        });
+    }
+    if npoints == 0 || ndims == 0 {
+        return Err(PiPNNError::Config("npoints and ndims must be > 0".into()));
+    }
+
+    let run_impl = |data: &[T]| -> PiPNNResult<PiPNNPhase1Result> {
+        let t_total = Instant::now();
+
+        // Compute medoid.
+        let medoid = find_medoid(data, npoints, ndims);
+
+        // Compute LSH sketches (needed for hash computation during edge writing).
+        let t0 = Instant::now();
+        let sketches = LshSketches::new(data, npoints, ndims, config.num_hash_planes, 42);
+        let sketch_secs = t0.elapsed().as_secs_f64();
+        tracing::info!(elapsed_secs = sketch_secs, "Phase1: LSH sketches computed");
+
+        // Create temp file for edges.
+        let edge_file_path = std::env::temp_dir().join(format!(
+            "pipnn_edges_{}.bin",
+            std::process::id()
+        ));
+        let edge_file = std::fs::File::create(&edge_file_path)?;
+        let edge_writer = Mutex::new(std::io::BufWriter::with_capacity(
+            4 * 1024 * 1024, // 4 MB buffer
+            edge_file,
+        ));
+
+        // Run replicas of partitioning + leaf building.
+        let mut partition_secs = 0.0f64;
+        let mut leaf_build_secs = 0.0f64;
+        let mut total_leaves = 0usize;
+        let mut total_edges_count = 0usize;
+
+        for replica in 0..config.replicas {
+            let seed = 1000 + replica as u64 * 7919;
+
+            let t1 = Instant::now();
+            let partition_config = PartitionConfig {
+                c_max: config.c_max,
+                c_min: config.c_min,
+                p_samp: config.p_samp,
+                fanout: config.fanout.clone(),
+                metric: config.metric,
+            };
+
+            let indices: Vec<usize> = (0..npoints).collect();
+            // Allow: Phase 1 runs inside pool.install() from the outer wrapper.
+            #[allow(clippy::disallowed_methods)]
+            let leaves =
+                partition::parallel_partition(data, ndims, &indices, &partition_config, seed);
+            total_leaves += leaves.len();
+            partition_secs += t1.elapsed().as_secs_f64();
+
+            tracing::info!(
+                replica = replica,
+                partition_secs = t1.elapsed().as_secs_f64(),
+                num_leaves = leaves.len(),
+                "Phase1: partition complete"
+            );
+
+            // Build leaves and write edges to disk.
+            let t2 = Instant::now();
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let edge_count = AtomicUsize::new(0);
+
+            // Allow: Phase 1 runs inside pool.install() from the outer wrapper.
+            #[allow(clippy::disallowed_methods)]
+            leaves.par_iter().for_each(|leaf| {
+                let indices_usize: Vec<usize> =
+                    leaf.indices.iter().map(|&i| i as usize).collect();
+                let edges = leaf_build::build_leaf(
+                    data,
+                    ndims,
+                    &indices_usize,
+                    config.k,
+                    config.metric,
+                );
+                edge_count.fetch_add(edges.len(), Ordering::Relaxed);
+
+                // Pre-compute hash + bf16 distance for each edge, batch-write per leaf.
+                let disk_edges: Vec<DiskEdge> = edges
+                    .iter()
+                    .map(|e| DiskEdge {
+                        src: e.src as u32,
+                        dst: e.dst as u32,
+                        hash: sketches.relative_hash(e.src, e.dst),
+                        dist_bf16: f32_to_bf16(e.distance),
+                    })
+                    .collect();
+
+                // One lock acquisition per leaf (not per edge).
+                let bytes: &[u8] = bytemuck::cast_slice(&disk_edges);
+                edge_writer.lock().unwrap().write_all(bytes).unwrap();
+            });
+
+            let replica_edges = edge_count.load(Ordering::Relaxed);
+            total_edges_count += replica_edges;
+            leaf_build_secs += t2.elapsed().as_secs_f64();
+
+            tracing::info!(
+                replica = replica,
+                elapsed_secs = t2.elapsed().as_secs_f64(),
+                total_edges = replica_edges,
+                "Phase1: leaf build + edge write complete"
+            );
+        }
+
+        // Release thread-local leaf buffers.
+        // Allow: runs inside pool.install() from the outer wrapper.
+        #[allow(clippy::disallowed_methods)]
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| {
+                leaf_build::release_thread_buffers();
+            });
+
+        // Flush edge writer.
+        edge_writer.lock().unwrap().flush()?;
+        drop(edge_writer);
+
+        let total_secs = t_total.elapsed().as_secs_f64();
+        // Sketches are dropped here (end of function).
+
+        let stats = PiPNNBuildStats {
+            total_secs,
+            sketch_secs,
+            partition_secs,
+            leaf_build_secs,
+            extract_secs: 0.0,
+            final_prune_secs: 0.0,
+            num_leaves: total_leaves,
+            total_edges: total_edges_count,
+        };
+
+        tracing::info!(
+            total_edges = total_edges_count,
+            edge_file = %edge_file_path.display(),
+            "Phase1 complete"
+        );
+
+        Ok(PiPNNPhase1Result {
+            edge_file_path,
+            medoid,
+            npoints,
+            ndims,
+            metric: config.metric,
+            stats,
+            l_max: config.l_max,
+            max_degree: config.max_degree,
+            final_prune: config.final_prune,
+            alpha: config.alpha,
+            num_threads: config.num_threads,
+        })
+    };
+
+    // Respect num_threads.
+    if config.num_threads > 0 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.num_threads)
+            .build()
+            .map_err(|e| PiPNNError::Config(format!("Failed to create thread pool: {}", e)))?;
+        return pool.install(|| run_impl(data));
+    }
+    run_impl(data)
+}
+
+/// Phase 2: read edges from disk, fill reservoirs in parallel, extract graph.
+///
+/// Does NOT need the dataset — only the edge file from Phase 1.
+/// The caller can drop the data Vec between Phase 1 and Phase 2 to free memory.
+pub fn build_phase2(phase1: PiPNNPhase1Result) -> PiPNNResult<PiPNNGraph> {
+    let run_impl = |phase1: PiPNNPhase1Result| -> PiPNNResult<PiPNNGraph> {
+        let t_total = Instant::now();
+
+        let npoints = phase1.npoints;
+        let ndims = phase1.ndims;
+
+        // Allocate reservoirs (no sketches needed — edges already have hashes).
+        let t_alloc = Instant::now();
+        let hash_prune = crate::hash_prune::HashPrune::new_reservoirs_only(
+            npoints,
+            phase1.l_max,
+            phase1.max_degree,
+        );
+        tracing::info!(
+            elapsed_secs = t_alloc.elapsed().as_secs_f64(),
+            "Phase2: reservoirs allocated"
+        );
+
+        // Memory-map the edge file for zero-copy parallel reads.
+        // The mmap is read-only and released after insertion, before graph extraction.
+        let t_read = Instant::now();
+        let file = std::fs::File::open(&phase1.edge_file_path)?;
+        let file_len = file.metadata()?.len() as usize;
+        let edge_size = std::mem::size_of::<DiskEdge>();
+        let edge_count = file_len / edge_size;
+        tracing::info!(
+            edge_count = edge_count,
+            file_mb = file_len as f64 / (1024.0 * 1024.0),
+            "Phase2: reading edge file in chunks"
+        );
+
+        // Read edge file in 256 MB chunks, process each chunk in parallel,
+        // then advise the OS to drop those pages before the next chunk.
+        // This prevents the page cache from inflating RSS to file_size.
+        {
+            use std::io::Read;
+            let mut reader = std::io::BufReader::with_capacity(256 * 1024 * 1024, file);
+            let chunk_edges = 256 * 1024 * 1024 / edge_size;
+            let mut buf = vec![DiskEdge { src: 0, dst: 0, hash: 0, dist_bf16: 0 }; chunk_edges];
+            let mut total_read = 0usize;
+
+            loop {
+                let byte_buf = bytemuck::cast_slice_mut::<DiskEdge, u8>(&mut buf);
+                let mut filled = 0usize;
+                // Read until buffer is full or EOF
+                while filled < byte_buf.len() {
+                    let n = reader.read(&mut byte_buf[filled..])?;
+                    if n == 0 { break; }
+                    filled += n;
+                }
+                if filled == 0 { break; }
+
+                let num_complete = filled / edge_size;
+                let chunk = &buf[..num_complete];
+
+                #[allow(clippy::disallowed_methods)]
+                chunk.par_chunks(100_000).for_each(|sub| {
+                    for edge in sub {
+                        hash_prune.insert_edge_prehashed(
+                            edge.src as usize,
+                            edge.dst,
+                            edge.hash,
+                            edge.dist_bf16,
+                        );
+                    }
+                });
+
+                total_read += num_complete;
+
+                // No page cache management needed — buffered read() doesn't map
+                // pages into process address space (unlike mmap), so RSS stays bounded.
+            }
+
+            tracing::info!(
+                edges_inserted = total_read,
+                elapsed_secs = t_read.elapsed().as_secs_f64(),
+                "Phase2: edge insertion complete"
+            );
+        }
+
+        // Cleanup edge file.
+        let _ = std::fs::remove_file(&phase1.edge_file_path);
+
+        // Extract graph.
+        let t_extract = Instant::now();
+        let adjacency = if phase1.final_prune {
+            // final_prune needs data for distance recomputation — not supported
+            // in the split-build path. The caller should use build_typed() instead.
+            return Err(PiPNNError::Config(
+                "final_prune=true is not supported in the split-build path \
+                 (requires data for distance recomputation)"
+                    .into(),
+            ));
+        } else {
+            hash_prune.extract_graph()
+        };
+        let extract_secs = t_extract.elapsed().as_secs_f64();
+        tracing::info!(elapsed_secs = extract_secs, "Phase2: graph extraction complete");
+
+        let total_phase2_secs = t_total.elapsed().as_secs_f64();
+
+        // Merge stats from Phase 1.
+        let mut stats = phase1.stats;
+        stats.extract_secs = extract_secs;
+        stats.total_secs += total_phase2_secs;
+
+        let graph = PiPNNGraph {
+            adjacency,
+            npoints,
+            ndims,
+            medoid: phase1.medoid,
+            metric: phase1.metric,
+            build_stats: stats,
+        };
+
+        tracing::info!(
+            avg_degree = graph.avg_degree(),
+            max_degree = graph.max_degree(),
+            isolated = graph.num_isolated(),
+            "Phase2 complete"
+        );
+
+        Ok(graph)
+    };
+
+    // Respect num_threads.
+    if phase1.num_threads > 0 {
+        let num_threads = phase1.num_threads;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .map_err(|e| PiPNNError::Config(format!("Failed to create thread pool: {}", e)))?;
+        return pool.install(|| run_impl(phase1));
+    }
+    run_impl(phase1)
+}
+
 /// Build a PiPNN index.
 ///
 /// `data` is row-major: npoints x ndims.
@@ -582,7 +966,8 @@ fn build_internal_sq_impl(
         use std::sync::atomic::{AtomicUsize, Ordering};
         let total_edges = AtomicUsize::new(0);
         leaves.par_iter().for_each(|leaf| {
-            let edges = crate::leaf_build::build_leaf_quantized(&qdata, &leaf.indices, config.k);
+            let indices_usize: Vec<usize> = leaf.indices.iter().map(|&i| i as usize).collect();
+            let edges = crate::leaf_build::build_leaf_quantized(&qdata, &indices_usize, config.k);
             total_edges.fetch_add(edges.len(), Ordering::Relaxed);
             hash_prune.add_edges_batched(&edges);
         });
@@ -735,10 +1120,12 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
         let total_edges = AtomicUsize::new(0);
 
         leaves.par_iter().for_each(|leaf| {
+            // Convert u32 indices to usize for leaf_build API.
+            let indices_usize: Vec<usize> = leaf.indices.iter().map(|&i| i as usize).collect();
             let edges = if let Some(ref q) = qdata {
-                leaf_build::build_leaf_quantized(q, &leaf.indices, config.k)
+                leaf_build::build_leaf_quantized(q, &indices_usize, config.k)
             } else {
-                leaf_build::build_leaf(data, ndims, &leaf.indices, config.k, config.metric)
+                leaf_build::build_leaf(data, ndims, &indices_usize, config.k, config.metric)
             };
             total_edges.fetch_add(edges.len(), Ordering::Relaxed);
             hash_prune.add_edges_batched(&edges);

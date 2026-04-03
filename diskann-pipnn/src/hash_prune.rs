@@ -172,8 +172,9 @@ impl LshSketches {
 /// Convert f32 distance to bf16 (truncate lower 16 mantissa bits).
 /// For non-negative values, bf16 bit ordering matches f32 ordering,
 /// so u16 comparison gives correct distance ordering.
+/// Public for use by the disk-edge two-phase build path.
 #[inline(always)]
-fn f32_to_bf16(v: f32) -> u16 {
+pub fn f32_to_bf16(v: f32) -> u16 {
     (v.to_bits() >> 16) as u16
 }
 
@@ -269,12 +270,80 @@ impl HashPruneReservoir {
         self.farthest_idx = max_idx;
     }
 
+    /// Try to insert a candidate neighbor with pre-computed hash and bf16 distance.
+    /// Used by the disk-edge two-phase build path where hash and bf16 distance
+    /// are computed once during Phase 1 and stored on disk.
+    #[inline]
+    pub fn insert_prehashed(&mut self, hash: u16, neighbor: u32, dist_bf16: u16) -> bool {
+        // Same logic as insert(), but with pre-computed bf16 distance.
+        if let Some(idx) = self.find_hash(hash) {
+            if dist_bf16 < self.entries[idx].distance {
+                let was_farthest = idx == self.farthest_idx;
+                self.entries[idx].neighbor = neighbor;
+                self.entries[idx].distance = dist_bf16;
+                if was_farthest {
+                    self.update_farthest();
+                }
+                return true;
+            }
+            return false;
+        }
+
+        if self.entries.len() < self.l_max {
+            let pos = self
+                .entries
+                .binary_search_by_key(&hash, |e| e.hash)
+                .unwrap_or_else(|e| e);
+            if pos <= self.farthest_idx && !self.entries.is_empty() {
+                self.farthest_idx += 1;
+            }
+            self.entries.insert(
+                pos,
+                ReservoirEntry {
+                    neighbor,
+                    distance: dist_bf16,
+                    hash,
+                },
+            );
+            if dist_bf16 >= self.farthest_dist {
+                self.farthest_dist = dist_bf16;
+                self.farthest_idx = pos;
+            }
+            return true;
+        }
+
+        if dist_bf16 < self.farthest_dist {
+            self.entries.remove(self.farthest_idx);
+            let pos = self
+                .entries
+                .binary_search_by_key(&hash, |e| e.hash)
+                .unwrap_or_else(|e| e);
+            self.entries.insert(
+                pos,
+                ReservoirEntry {
+                    neighbor,
+                    distance: dist_bf16,
+                    hash,
+                },
+            );
+            self.update_farthest();
+            return true;
+        }
+
+        false
+    }
+
     /// Try to insert a candidate neighbor with the given hash and distance.
     /// Distance is converted to bf16 at the boundary for compact storage.
     #[inline]
     pub fn insert(&mut self, hash: u16, neighbor: u32, distance: f32) -> bool {
         let dist_bf16 = f32_to_bf16(distance);
+        self.insert_bf16(hash, neighbor, dist_bf16)
+    }
 
+    /// Core insertion logic operating on pre-computed bf16 distance.
+    #[inline]
+    fn insert_bf16(&mut self, hash: u16, neighbor: u32, dist_bf16: u16) -> bool {
         // If the hash bucket already exists, keep the closer point.
         if let Some(idx) = self.find_hash(hash) {
             if dist_bf16 < self.entries[idx].distance {
@@ -419,6 +488,36 @@ impl HashPrune {
             sketches,
             max_degree,
         }
+    }
+
+    /// Create a HashPrune with reservoirs only (no sketches).
+    /// Used by Phase 2 of the disk-edge two-phase build: edges already have
+    /// pre-computed hashes, so sketches are not needed.
+    pub fn new_reservoirs_only(npoints: usize, l_max: usize, max_degree: usize) -> Self {
+        let reservoirs = (0..npoints)
+            .map(|_| Mutex::new(HashPruneReservoir::new_lazy(l_max)))
+            .collect();
+        // Create a dummy LshSketches with zero planes (never used).
+        let sketches = LshSketches {
+            num_planes: 0,
+            sketches: Vec::new(),
+            npoints: 0,
+        };
+        Self {
+            reservoirs,
+            sketches,
+            max_degree,
+        }
+    }
+
+    /// Insert an edge with pre-computed hash and bf16 distance.
+    /// Used by Phase 2 of the disk-edge two-phase build path.
+    /// Thread-safe: acquires lock on p's reservoir only.
+    #[inline]
+    pub fn insert_edge_prehashed(&self, p: usize, neighbor: u32, hash: u16, dist_bf16: u16) {
+        self.reservoirs[p]
+            .lock()
+            .insert_prehashed(hash, neighbor, dist_bf16);
     }
 
     /// Add an edge from point `p` to candidate `c` with the given distance.

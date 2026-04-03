@@ -14,7 +14,8 @@ diskann-utils = { workspace = true, default-features = false, features = ["rayon
 rayon = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
-bytemuck = { workspace = true, features = ["must_cast"] }
+bytemuck = { workspace = true, features = ["must_cast", "derive"] }
+memmap2 = "0.9"
 num-traits = { workspace = true }
 diskann-linalg = { workspace = true }
 half = { workspace = true }
