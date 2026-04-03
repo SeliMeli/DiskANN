@@ -275,62 +275,7 @@ impl HashPruneReservoir {
     /// are computed once during Phase 1 and stored on disk.
     #[inline]
     pub fn insert_prehashed(&mut self, hash: u16, neighbor: u32, dist_bf16: u16) -> bool {
-        // Same logic as insert(), but with pre-computed bf16 distance.
-        if let Some(idx) = self.find_hash(hash) {
-            if dist_bf16 < self.entries[idx].distance {
-                let was_farthest = idx == self.farthest_idx;
-                self.entries[idx].neighbor = neighbor;
-                self.entries[idx].distance = dist_bf16;
-                if was_farthest {
-                    self.update_farthest();
-                }
-                return true;
-            }
-            return false;
-        }
-
-        if self.entries.len() < self.l_max {
-            let pos = self
-                .entries
-                .binary_search_by_key(&hash, |e| e.hash)
-                .unwrap_or_else(|e| e);
-            if pos <= self.farthest_idx && !self.entries.is_empty() {
-                self.farthest_idx += 1;
-            }
-            self.entries.insert(
-                pos,
-                ReservoirEntry {
-                    neighbor,
-                    distance: dist_bf16,
-                    hash,
-                },
-            );
-            if dist_bf16 >= self.farthest_dist {
-                self.farthest_dist = dist_bf16;
-                self.farthest_idx = pos;
-            }
-            return true;
-        }
-
-        if dist_bf16 < self.farthest_dist {
-            self.entries.remove(self.farthest_idx);
-            let pos = self
-                .entries
-                .binary_search_by_key(&hash, |e| e.hash)
-                .unwrap_or_else(|e| e);
-            self.entries.insert(
-                pos,
-                ReservoirEntry {
-                    neighbor,
-                    distance: dist_bf16,
-                    hash,
-                },
-            );
-            self.update_farthest();
-            return true;
-        }
-
-        false
+        self.insert_bf16(hash, neighbor, dist_bf16)
     }
 
     /// Try to insert a candidate neighbor with the given hash and distance.

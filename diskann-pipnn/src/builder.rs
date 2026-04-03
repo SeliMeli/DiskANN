@@ -348,7 +348,7 @@ pub fn build_typed<T: VectorRepr + Send + Sync>(
 // ---------------------------------------------------------------------------
 
 /// A single edge record stored on disk between Phase 1 and Phase 2.
-/// repr(C) + Pod ensures safe zero-copy mmap reads via bytemuck::cast_slice.
+/// repr(C) + Pod ensures safe cast via bytemuck::cast_slice.
 /// 12 bytes per edge: src(4) + dst(4) + hash(2) + dist_bf16(2).
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -629,8 +629,8 @@ pub fn build_phase2(mut phase1: PiPNNPhase1Result) -> PiPNNResult<PiPNNGraph> {
             "Phase2: reservoirs allocated"
         );
 
-        // Memory-map the edge file for zero-copy parallel reads.
-        // The mmap is read-only and released after insertion, before graph extraction.
+        // Read edge file in 256 MB chunks via BufReader for parallel insertion.
+        // Each chunk is processed with par_chunks before moving to the next.
         let t_read = Instant::now();
         let file = std::fs::File::open(&edge_file_path)?;
         let file_len = file.metadata()?.len() as usize;

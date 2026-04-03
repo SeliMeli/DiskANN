@@ -374,8 +374,8 @@ where
     /// Fully synchronous PiPNN build: PQ compression + PiPNN graph + disk layout.
     /// Runs without tokio runtime, avoiding the ~1.6 GB async future overhead.
     ///
-    /// When the estimated one-shot RAM exceeds the build memory budget, this
-    /// automatically routes to the merged shard path.
+    /// When the estimated one-shot RAM exceeds the build memory budget, this tries
+    /// disk-edges first (Phase1 writes edges to disk, drop data, Phase2 fills reservoirs). If that also exceeds budget, falls back to merged shards.
     #[cfg(feature = "pipnn")]
     fn build_sync_pipnn(&mut self) -> ANNResult<()> {
         let mut logger = PerfLogger::new_disk_index_build_logger();
