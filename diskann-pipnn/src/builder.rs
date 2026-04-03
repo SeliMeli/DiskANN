@@ -368,8 +368,8 @@ unsafe impl bytemuck::Pod for DiskEdge {}
 /// Result of Phase 1 (partition + leaf build + edge writing).
 /// Carries everything Phase 2 needs without the dataset.
 pub struct PiPNNPhase1Result {
-    /// Path to the temporary edge file.
-    pub edge_file_path: std::path::PathBuf,
+    /// Path to the temporary edge file. Cleaned up on drop.
+    edge_file_path: Option<std::path::PathBuf>,
     /// Medoid (graph entry point).
     pub medoid: usize,
     /// Number of points.
@@ -386,6 +386,22 @@ pub struct PiPNNPhase1Result {
     pub final_prune: bool,
     pub alpha: f32,
     pub num_threads: usize,
+}
+
+impl PiPNNPhase1Result {
+    /// Take the edge file path (for Phase 2 reading). Prevents double-delete.
+    fn take_edge_file_path(&mut self) -> std::path::PathBuf {
+        self.edge_file_path.take().expect("edge file path already consumed")
+    }
+}
+
+/// Ensures the temp edge file is cleaned up on all paths (normal, error, panic).
+impl Drop for PiPNNPhase1Result {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.edge_file_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Phase 1: partition, leaf build, and edge writing to a temp file.
@@ -475,8 +491,9 @@ pub fn build_phase1<T: VectorRepr + Send + Sync>(
 
             // Build leaves and write edges to disk.
             let t2 = Instant::now();
-            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
             let edge_count = AtomicUsize::new(0);
+            let write_error = AtomicBool::new(false);
 
             // Allow: Phase 1 runs inside pool.install() from the outer wrapper.
             #[allow(clippy::disallowed_methods)]
@@ -505,9 +522,18 @@ pub fn build_phase1<T: VectorRepr + Send + Sync>(
 
                 // One lock acquisition per leaf (not per edge).
                 let bytes: &[u8] = bytemuck::cast_slice(&disk_edges);
-                edge_writer.lock().unwrap().write_all(bytes).unwrap();
+                if let Err(e) = edge_writer.lock().unwrap().write_all(bytes) {
+                    write_error.store(true, Ordering::Relaxed);
+                    tracing::error!("edge write failed: {}", e);
+                }
             });
 
+            if write_error.load(Ordering::Relaxed) {
+                return Err(PiPNNError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "edge file write failed during Phase 1",
+                )));
+            }
             let replica_edges = edge_count.load(Ordering::Relaxed);
             total_edges_count += replica_edges;
             leaf_build_secs += t2.elapsed().as_secs_f64();
@@ -554,7 +580,7 @@ pub fn build_phase1<T: VectorRepr + Send + Sync>(
         );
 
         Ok(PiPNNPhase1Result {
-            edge_file_path,
+            edge_file_path: Some(edge_file_path),
             medoid,
             npoints,
             ndims,
@@ -583,12 +609,13 @@ pub fn build_phase1<T: VectorRepr + Send + Sync>(
 ///
 /// Does NOT need the dataset — only the edge file from Phase 1.
 /// The caller can drop the data Vec between Phase 1 and Phase 2 to free memory.
-pub fn build_phase2(phase1: PiPNNPhase1Result) -> PiPNNResult<PiPNNGraph> {
-    let run_impl = |phase1: PiPNNPhase1Result| -> PiPNNResult<PiPNNGraph> {
+pub fn build_phase2(mut phase1: PiPNNPhase1Result) -> PiPNNResult<PiPNNGraph> {
+    let run_impl = |mut phase1: PiPNNPhase1Result| -> PiPNNResult<PiPNNGraph> {
         let t_total = Instant::now();
 
         let npoints = phase1.npoints;
         let ndims = phase1.ndims;
+        let edge_file_path = phase1.take_edge_file_path();
 
         // Allocate reservoirs (no sketches needed — edges already have hashes).
         let t_alloc = Instant::now();
@@ -605,7 +632,7 @@ pub fn build_phase2(phase1: PiPNNPhase1Result) -> PiPNNResult<PiPNNGraph> {
         // Memory-map the edge file for zero-copy parallel reads.
         // The mmap is read-only and released after insertion, before graph extraction.
         let t_read = Instant::now();
-        let file = std::fs::File::open(&phase1.edge_file_path)?;
+        let file = std::fs::File::open(&edge_file_path)?;
         let file_len = file.metadata()?.len() as usize;
         let edge_size = std::mem::size_of::<DiskEdge>();
         let edge_count = file_len / edge_size;
@@ -665,7 +692,7 @@ pub fn build_phase2(phase1: PiPNNPhase1Result) -> PiPNNResult<PiPNNGraph> {
         }
 
         // Cleanup edge file.
-        let _ = std::fs::remove_file(&phase1.edge_file_path);
+        let _ = std::fs::remove_file(&edge_file_path);
 
         // Extract graph.
         let t_extract = Instant::now();
@@ -686,7 +713,7 @@ pub fn build_phase2(phase1: PiPNNPhase1Result) -> PiPNNResult<PiPNNGraph> {
         let total_phase2_secs = t_total.elapsed().as_secs_f64();
 
         // Merge stats from Phase 1.
-        let mut stats = phase1.stats;
+        let mut stats = phase1.stats.clone();
         stats.extract_secs = extract_secs;
         stats.total_secs += total_phase2_secs;
 

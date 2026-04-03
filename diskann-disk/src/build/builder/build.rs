@@ -1045,8 +1045,9 @@ fn estimate_pipnn_disk_edges_ram(
     config: &diskann_pipnn::PiPNNConfig,
 ) -> f64 {
     let c = PiPNNMemComponents::compute(npoints, ndims, type_size, config);
-    let write_buf = 64.0 * 1024.0 * 1024.0; // BufWriter buffer
-    let read_buf = 256.0 * 1024.0 * 1024.0; // Phase 2 read chunk
+    let write_buf = 4.0 * 1024.0 * 1024.0; // BufWriter capacity (4 MB)
+    // Phase 2 allocates two 256 MB regions: BufReader internal buffer + DiskEdge processing buffer.
+    let read_buf = 512.0 * 1024.0 * 1024.0;
 
     let phase1 = c.data + c.sketches + c.partition_clusters + write_buf + c.overhead;
     let phase2 = c.reservoirs + read_buf + c.overhead;
