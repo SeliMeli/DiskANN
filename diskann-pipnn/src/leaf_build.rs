@@ -26,6 +26,9 @@ pub struct LeafBuffers {
     pub dot_matrix: Vec<f32>,
     pub dist_matrix: Vec<f32>,
     pub seen: Vec<bool>,
+    /// Contiguous f16 gather buffer for MKL f16f16f32 GEMM path.
+    #[cfg(feature = "mkl-fp16")]
+    pub local_data_f16: Vec<half::f16>,
 }
 
 impl Default for LeafBuffers {
@@ -42,6 +45,8 @@ impl LeafBuffers {
             dot_matrix: Vec::new(),
             dist_matrix: Vec::new(),
             seen: Vec::new(),
+            #[cfg(feature = "mkl-fp16")]
+            local_data_f16: Vec::new(),
         }
     }
 
@@ -63,6 +68,10 @@ impl LeafBuffers {
         }
         if self.seen.len() < nn {
             self.seen.resize(nn, false);
+        }
+        #[cfg(feature = "mkl-fp16")]
+        if self.local_data_f16.len() < nd {
+            self.local_data_f16.resize(nd, half::f16::ZERO);
         }
     }
 }
@@ -105,6 +114,10 @@ pub fn release_thread_buffers() {
         bufs.dot_matrix = Vec::new();
         bufs.dist_matrix = Vec::new();
         bufs.seen = Vec::new();
+        #[cfg(feature = "mkl-fp16")]
+        {
+            bufs.local_data_f16 = Vec::new();
+        }
     });
     QUANT_BUFFERS.with(|cell| {
         let mut bufs = cell.borrow_mut();
@@ -310,7 +323,7 @@ fn extract_knn_general(dist_matrix: &[f32], n: usize, k: usize) -> Vec<(usize, u
 /// Build a leaf partition: compute all-pairs distances and extract bi-directed k-NN edges.
 ///
 /// Returns edges as (global_src, global_dst, distance).
-pub fn build_leaf<T: VectorRepr>(
+pub fn build_leaf<T: VectorRepr + 'static>(
     data: &[T],
     ndims: usize,
     indices: &[usize],
@@ -330,7 +343,7 @@ pub fn build_leaf<T: VectorRepr>(
 
 /// Build a leaf using caller-provided buffers, bypassing thread-local access.
 /// Use this when processing multiple leaves in a batch to amortize TLS overhead.
-pub fn build_leaf_with_buffers<T: VectorRepr>(
+pub fn build_leaf_with_buffers<T: VectorRepr + 'static>(
     data: &[T],
     ndims: usize,
     indices: &[usize],
@@ -341,45 +354,87 @@ pub fn build_leaf_with_buffers<T: VectorRepr>(
     let n = indices.len();
     bufs.ensure_capacity(n, ndims);
 
-    // Extract local data into reused buffer, converting T -> f32 on the fly.
-    let local_data = &mut bufs.local_data[..n * ndims];
-    for (i, &idx) in indices.iter().enumerate() {
-        let src = &data[idx * ndims..(idx + 1) * ndims];
-        let dst = &mut local_data[i * ndims..(i + 1) * ndims];
-        T::as_f32_into(src, dst).expect("f32 conversion");
-    }
+    // Determine if we can use MKL f16f16f32 path (T == f16 + feature enabled).
+    #[cfg(feature = "mkl-fp16")]
+    let use_mkl = std::any::TypeId::of::<T>() == std::any::TypeId::of::<half::f16>();
 
-    // Compute norms only for metrics that use them: L2 needs squared norms,
-    // Cosine needs sqrt norms. CosineNormalized (pre-normalized data) and
-    // InnerProduct skip this entirely — saves an extra pass over `local_data`
-    // (~384 KB per leaf at d=384) which would otherwise contend for L2/L3.
-    let needs_norms = matches!(
-        metric,
-        diskann_vector::distance::Metric::L2 | diskann_vector::distance::Metric::Cosine
-    );
-    if needs_norms {
-        let norms_sq = &mut bufs.norms_sq[..n];
-        for i in 0..n {
-            let row = &local_data[i * ndims..(i + 1) * ndims];
-            let mut norm = 0.0f32;
-            for &v in row.iter() {
-                norm += v * v;
-            }
-            norms_sq[i] = norm;
+    // GEMM: produce dot_matrix = local_data * local_data^T.
+    // MKL path: gather f16 → f16f16f32 GEMM → f32 dots directly.
+    // faer path: gather f16→f32 → sgemm → f32 dots.
+    #[cfg(feature = "mkl-fp16")]
+    let used_mkl = if use_mkl {
+        // Gather f16 data contiguously (zero-cost copy, no type conversion).
+        let local_f16 = &mut bufs.local_data_f16[..n * ndims];
+        // SAFETY: T is half::f16 (checked via TypeId above), same layout.
+        let data_f16: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len())
+        };
+        for (i, &idx) in indices.iter().enumerate() {
+            let src = &data_f16[idx * ndims..(idx + 1) * ndims];
+            local_f16[i * ndims..(i + 1) * ndims].copy_from_slice(src);
         }
-    }
 
-    // GEMM: dots = local_data * local_data^T
-    let dot_matrix = &mut bufs.dot_matrix[..n * n];
-    crate::gemm::sgemm_aat(local_data, n, ndims, dot_matrix);
+        // f16 input → f32 output GEMM.
+        let dot_matrix = &mut bufs.dot_matrix[..n * n];
+        crate::gemm::mkl_f16f16f32_aat(local_f16, n, ndims, dot_matrix);
+
+        // For L2/Cosine, we need f32 norms. Compute from the GEMM diagonal
+        // (dot(a,a) = ||a||²) which avoids a separate f16→f32 conversion pass.
+        let needs_norms = matches!(
+            metric,
+            diskann_vector::distance::Metric::L2 | diskann_vector::distance::Metric::Cosine
+        );
+        if needs_norms {
+            let norms_sq = &mut bufs.norms_sq[..n];
+            for i in 0..n {
+                norms_sq[i] = dot_matrix[i * n + i];
+            }
+        }
+
+        true
+    } else {
+        false
+    };
+
+    #[cfg(not(feature = "mkl-fp16"))]
+    let used_mkl = false;
+
+    if !used_mkl {
+        // faer path: convert T → f32, then sgemm.
+        let local_data = &mut bufs.local_data[..n * ndims];
+        for (i, &idx) in indices.iter().enumerate() {
+            let src = &data[idx * ndims..(idx + 1) * ndims];
+            let dst = &mut local_data[i * ndims..(i + 1) * ndims];
+            T::as_f32_into(src, dst).expect("f32 conversion");
+        }
+
+        let needs_norms = matches!(
+            metric,
+            diskann_vector::distance::Metric::L2 | diskann_vector::distance::Metric::Cosine
+        );
+        if needs_norms {
+            let norms_sq = &mut bufs.norms_sq[..n];
+            for i in 0..n {
+                let row = &local_data[i * ndims..(i + 1) * ndims];
+                let mut norm = 0.0f32;
+                for &v in row.iter() {
+                    norm += v * v;
+                }
+                norms_sq[i] = norm;
+            }
+        }
+
+        let dot_matrix = &mut bufs.dot_matrix[..n * n];
+        crate::gemm::sgemm_aat(local_data, n, ndims, dot_matrix);
+    }
 
     let norms_sq = &bufs.norms_sq[..n];
 
     // Convert to distance matrix using the target metric.
     use diskann_vector::distance::Metric;
+    let dot_matrix = &mut bufs.dot_matrix[..n * n];
     let dist_matrix = match metric {
         Metric::CosineNormalized => {
-            // Pre-normalized: dist = 1 - dot(a, b)
             for i in 0..n {
                 let row = &mut dot_matrix[i * n..(i + 1) * n];
                 for val in row.iter_mut() {
@@ -390,7 +445,6 @@ pub fn build_leaf_with_buffers<T: VectorRepr>(
             &mut bufs.dot_matrix[..n * n]
         }
         Metric::Cosine => {
-            // Unnormalized: dist = 1 - dot(a,b)/(||a||*||b||)
             let dist = &mut bufs.dist_matrix[..n * n];
             for i in 0..n {
                 let ni_sqrt = norms_sq[i].sqrt();

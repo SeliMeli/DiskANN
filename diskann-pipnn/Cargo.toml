@@ -36,3 +36,6 @@ workspace = true
 [[bench]]
 name = "pipnn_bench"
 harness = false
+
+[features]
+mkl-fp16 = []

@@ -216,3 +216,25 @@ mod tests {
         assert!((c[0] - 15.0).abs() < 1e-6);
     }
 }
+
+// Native f16→f32 GEMM via MKL cblas_gemm_f16f16f32 — f16 in, f32 out.
+// Eliminates fp16→f32 input conversion AND output conversion in one shot.
+// Caller gets f32 dots directly, ready for distance computation.
+#[cfg(feature = "mkl-fp16")]
+#[inline]
+pub fn mkl_f16f16f32_abt(
+    a: &[half::f16],
+    m: usize,
+    k: usize,
+    b: &[half::f16],
+    n: usize,
+    c: &mut [f32],
+) {
+    crate::mkl_gemm::gemm_f16f16f32_abt(a, m, k, b, n, c);
+}
+
+#[cfg(feature = "mkl-fp16")]
+#[inline]
+pub fn mkl_f16f16f32_aat(a: &[half::f16], m: usize, k: usize, c: &mut [f32]) {
+    crate::mkl_gemm::gemm_f16f16f32_aat(a, m, k, c);
+}

@@ -11,6 +11,9 @@
 //! 2. Building local graphs within each leaf cluster using GEMM-based all-pairs distance
 //! 3. Merging edges from overlapping partitions using HashPrune (LSH-based online pruning)
 
+#[cfg(feature = "mkl-fp16")]
+pub mod mkl_gemm;
+
 pub mod builder;
 pub mod gemm;
 pub mod hash_prune;
