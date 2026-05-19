@@ -37,6 +37,13 @@ extern "C" {
         ldc: i32,
     );
 
+    // MKL exports both `mkl_set_num_threads` (lowercase, Fortran-style — expects
+    // `*const int`) AND `MKL_Set_Num_Threads` (camel case, C ABI — takes int by
+    // value). They live at different addresses (0x28ea80 vs 0x28ea90 in
+    // libmkl_intel_lp64.so.3). Calling the Fortran symbol with an int-by-value
+    // segfaults instantly (`mov (%rdi),%edi` dereferences address 0x1). Use the
+    // C symbol via #[link_name].
+    #[link_name = "MKL_Set_Num_Threads"]
     fn mkl_set_num_threads(n: i32);
 }
 
@@ -46,7 +53,7 @@ static MKL_INIT: std::sync::Once = std::sync::Once::new();
 
 fn ensure_mkl_single_threaded() {
     MKL_INIT.call_once(|| {
-        // SAFETY: FFI call with no preconditions.
+        // SAFETY: FFI call to C-ABI MKL_Set_Num_Threads, int by value.
         unsafe { mkl_set_num_threads(1) };
     });
 }
