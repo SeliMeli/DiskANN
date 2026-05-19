@@ -90,7 +90,23 @@ pub fn gemm_f16f16f32_abt(
 }
 
 /// Compute C = A * A^T where A is m×k (f16), C is m×m (f32).
-#[inline]
+///
+/// MKL's `cblas_gemm_f16f16f32` is a general GEMM with no symmetric (SYRK)
+/// variant for f16 inputs. Passing the same pointer for A and B segfaults inside
+/// `libmkl_intel_lp64.so.3` (observed: NULL-deref at offset 0x28ea84). We copy
+/// A into a thread-local scratch buffer and call abt with two distinct pointers.
 pub fn gemm_f16f16f32_aat(a: &[f16], m: usize, k: usize, c: &mut [f32]) {
-    gemm_f16f16f32_abt(a, m, k, a, m, c);
+    use std::cell::RefCell;
+    thread_local! {
+        static B_SCRATCH: RefCell<Vec<f16>> = const { RefCell::new(Vec::new()) };
+    }
+    B_SCRATCH.with(|cell| {
+        let mut b = cell.borrow_mut();
+        let needed = m * k;
+        if b.len() < needed {
+            b.resize(needed, f16::ZERO);
+        }
+        b[..needed].copy_from_slice(&a[..needed]);
+        gemm_f16f16f32_abt(a, m, k, &b[..needed], m, c);
+    });
 }
