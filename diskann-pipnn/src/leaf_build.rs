@@ -29,6 +29,14 @@ pub struct LeafBuffers {
     /// Contiguous f16 gather buffer for MKL f16f16f32 GEMM path.
     #[cfg(feature = "mkl-fp16")]
     pub local_data_f16: Vec<half::f16>,
+    /// Reusable buffer for knn results: (local_dst_idx, distance) per row×k.
+    pub knn_result: Vec<(u32, f32)>,
+    /// Reusable buffer for bidirected edges output.
+    pub edges: Vec<Edge>,
+    /// Reusable buffer for u32→usize index conversion.
+    pub indices_usize: Vec<usize>,
+    /// Reusable scratch indices for extract_knn_general (quickselect).
+    pub select_indices: Vec<u32>,
 }
 
 impl Default for LeafBuffers {
@@ -47,6 +55,10 @@ impl LeafBuffers {
             seen: Vec::new(),
             #[cfg(feature = "mkl-fp16")]
             local_data_f16: Vec::new(),
+            knn_result: Vec::new(),
+            edges: Vec::new(),
+            indices_usize: Vec::new(),
+            select_indices: Vec::new(),
         }
     }
 
@@ -114,6 +126,10 @@ pub fn release_thread_buffers() {
         bufs.dot_matrix = Vec::new();
         bufs.dist_matrix = Vec::new();
         bufs.seen = Vec::new();
+        bufs.knn_result = Vec::new();
+        bufs.edges = Vec::new();
+        bufs.indices_usize = Vec::new();
+        bufs.select_indices = Vec::new();
         #[cfg(feature = "mkl-fp16")]
         {
             bufs.local_data_f16 = Vec::new();
@@ -134,6 +150,237 @@ pub struct Edge {
     pub dst: usize,
     pub distance: f32,
 }
+
+// ─── Allocation-free _into variants ─────────────────────────────────────────
+
+/// Extract k nearest neighbors into a caller-provided buffer.
+/// Output format: `out[i * actual_k + t] = (dst_local_idx, distance)` for row i, t-th neighbor.
+/// Returns `actual_k` (= `k.min(n-1)`).
+fn extract_knn_into(
+    dist_matrix: &[f32],
+    n: usize,
+    k: usize,
+    out: &mut Vec<(u32, f32)>,
+    select_scratch: &mut Vec<u32>,
+) -> usize {
+    out.clear();
+    if n <= 1 || k == 0 {
+        return 0;
+    }
+    let actual_k = k.min(n - 1);
+    if actual_k <= 3 {
+        extract_knn_small_into(dist_matrix, n, actual_k, out);
+    } else {
+        extract_knn_general_into(dist_matrix, n, actual_k, out, select_scratch);
+    }
+    actual_k
+}
+
+/// Specialized extraction for k ≤ 3 into caller buffer.
+fn extract_knn_small_into(dist_matrix: &[f32], n: usize, k: usize, out: &mut Vec<(u32, f32)>) {
+    debug_assert!(k <= 3 && k < n);
+    out.reserve(n * k);
+
+    for i in 0..n {
+        let row = &dist_matrix[i * n..(i + 1) * n];
+        let mut top: [(u32, f32); 3] = [(u32::MAX, f32::MAX); 3];
+        let threshold_idx = k - 1;
+
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        {
+            use std::arch::x86_64::*;
+            let chunks = n / 16;
+            unsafe {
+                for chunk in 0..chunks {
+                    let base = chunk * 16;
+                    let thresh = _mm512_set1_ps(top[threshold_idx].1);
+                    let dists = _mm512_loadu_ps(row.as_ptr().add(base));
+                    let mask = _mm512_cmp_ps_mask::<_CMP_LT_OQ>(dists, thresh);
+                    if mask != 0 {
+                        let mut d_arr = [0.0f32; 16];
+                        _mm512_storeu_ps(d_arr.as_mut_ptr(), dists);
+                        let mut m = mask;
+                        while m != 0 {
+                            let lane = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            let j = base + lane;
+                            if j == i { continue; }
+                            let d = d_arr[lane];
+                            if d < top[threshold_idx].1 {
+                                top[threshold_idx] = (j as u32, d);
+                                for t in (1..k).rev() {
+                                    if top[t].1 < top[t - 1].1 {
+                                        top.swap(t, t - 1);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for j in (chunks * 16)..n {
+                    if j == i { continue; }
+                    let d = *row.get_unchecked(j);
+                    if d < top[threshold_idx].1 {
+                        top[threshold_idx] = (j as u32, d);
+                        for t in (1..k).rev() {
+                            if top[t].1 < top[t - 1].1 {
+                                top.swap(t, t - 1);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        {
+            use std::arch::x86_64::*;
+            let chunks = n / 8;
+            unsafe {
+                for chunk in 0..chunks {
+                    let base = chunk * 8;
+                    let thresh = _mm256_set1_ps(top[threshold_idx].1);
+                    let dists = _mm256_loadu_ps(row.as_ptr().add(base));
+                    let mask = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_LT_OQ>(dists, thresh));
+                    if mask != 0 {
+                        let mut d_arr = [0.0f32; 8];
+                        _mm256_storeu_ps(d_arr.as_mut_ptr(), dists);
+                        let mut m = mask as u32;
+                        while m != 0 {
+                            let lane = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            let j = base + lane;
+                            if j == i { continue; }
+                            let d = d_arr[lane];
+                            if d < top[threshold_idx].1 {
+                                top[threshold_idx] = (j as u32, d);
+                                for t in (1..k).rev() {
+                                    if top[t].1 < top[t - 1].1 {
+                                        top.swap(t, t - 1);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for j in (chunks * 8)..n {
+                    if j == i { continue; }
+                    let d = *row.get_unchecked(j);
+                    if d < top[threshold_idx].1 {
+                        top[threshold_idx] = (j as u32, d);
+                        for t in (1..k).rev() {
+                            if top[t].1 < top[t - 1].1 {
+                                top.swap(t, t - 1);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for j in 0..n {
+                if j == i { continue; }
+                let d = unsafe { *row.get_unchecked(j) };
+                if d < top[threshold_idx].1 {
+                    top[threshold_idx] = (j as u32, d);
+                    for t in (1..k).rev() {
+                        if top[t].1 < top[t - 1].1 {
+                            top.swap(t, t - 1);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        for t in 0..k {
+            out.push((top[t].0, top[t].1));
+        }
+    }
+}
+
+/// General extraction for k > 3, reusing a scratch index buffer.
+fn extract_knn_general_into(
+    dist_matrix: &[f32],
+    n: usize,
+    k: usize,
+    out: &mut Vec<(u32, f32)>,
+    indices: &mut Vec<u32>,
+) {
+    out.reserve(n * k);
+    indices.clear();
+    indices.extend(0..n as u32);
+
+    for i in 0..n {
+        let row = &dist_matrix[i * n..(i + 1) * n];
+
+        for j in 0..n {
+            unsafe { *indices.get_unchecked_mut(j) = j as u32; }
+        }
+
+        if k < n {
+            indices.select_nth_unstable_by(k - 1, |&a, &b| {
+                let da = unsafe { *row.get_unchecked(a as usize) };
+                let db = unsafe { *row.get_unchecked(b as usize) };
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        for idx in 0..k {
+            let j = unsafe { *indices.get_unchecked(idx) } as usize;
+            out.push((j as u32, row[j]));
+        }
+    }
+}
+
+/// Bidirect knn results into caller-provided edge buffer.
+/// `knn` has `n * actual_k` entries: row i's neighbors are at `knn[i*actual_k..(i+1)*actual_k]`.
+fn make_bidirected_edges_into(
+    knn: &[(u32, f32)],
+    actual_k: usize,
+    dist_matrix: &[f32],
+    n: usize,
+    indices: &[usize],
+    seen: &mut [bool],
+    out: &mut Vec<Edge>,
+) {
+    out.clear();
+    out.reserve(knn.len() * 2);
+    for i in 0..n {
+        let row_knn = &knn[i * actual_k..(i + 1) * actual_k];
+        for &(dst_local, dist) in row_knn {
+            let dst = dst_local as usize;
+            if !seen[i * n + dst] {
+                seen[i * n + dst] = true;
+                out.push(Edge {
+                    src: indices[i],
+                    dst: indices[dst],
+                    distance: dist,
+                });
+            }
+            let rev_dist = dist_matrix[dst * n + i];
+            if !seen[dst * n + i] {
+                seen[dst * n + i] = true;
+                out.push(Edge {
+                    src: indices[dst],
+                    dst: indices[i],
+                    distance: rev_dist,
+                });
+            }
+        }
+    }
+}
+
+// ─── Original allocating variants (kept for backward compatibility / tests) ──
 
 /// Extract k nearest neighbors for each point from the distance matrix.
 ///
@@ -484,10 +731,56 @@ pub fn build_leaf_with_buffers<T: VectorRepr + 'static>(
         }
     };
 
-    let local_edges = extract_knn(dist_matrix, n, k);
+    // Extract knn and bidirect edges using reusable buffers (zero allocation).
+    // Split borrow: dist_matrix borrows from bufs.dot_matrix or bufs.dist_matrix,
+    // but knn_result, edges, seen, and select_indices are separate fields.
+    // We need to reborrow dist_matrix as a raw pointer to break the split.
+    let dist_ptr = dist_matrix.as_ptr();
+    let dist_len = n * n;
+
+    let actual_k = extract_knn_into(
+        // SAFETY: dist_ptr points to either bufs.dot_matrix or bufs.dist_matrix,
+        // both of which remain valid and unmodified during extract_knn_into.
+        unsafe { std::slice::from_raw_parts(dist_ptr, dist_len) },
+        n,
+        k,
+        &mut bufs.knn_result,
+        &mut bufs.select_indices,
+    );
     let seen = &mut bufs.seen[..n * n];
     seen.fill(false);
-    make_bidirected_edges(&local_edges, dist_matrix, n, indices, seen)
+    make_bidirected_edges_into(
+        &bufs.knn_result,
+        actual_k,
+        // SAFETY: same pointer, still valid and unmodified.
+        unsafe { std::slice::from_raw_parts(dist_ptr, dist_len) },
+        n,
+        indices,
+        seen,
+        &mut bufs.edges,
+    );
+
+    // Move edges out, leaving an empty (but allocated) Vec in bufs for reuse.
+    // The caller consumes the Vec; next call to build_leaf_with_buffers will
+    // find bufs.edges empty but with capacity from prior use.
+    std::mem::take(&mut bufs.edges)
+}
+
+/// Build a leaf into `bufs.edges` without allocating. Returns edge count.
+/// The caller reads edges from `bufs.edges[..returned_count]`.
+pub fn build_leaf_into<T: VectorRepr + 'static>(
+    data: &[T],
+    ndims: usize,
+    indices: &[usize],
+    k: usize,
+    metric: diskann_vector::distance::Metric,
+    bufs: &mut LeafBuffers,
+) -> usize {
+    let edges = build_leaf_with_buffers(data, ndims, indices, k, metric, bufs);
+    let count = edges.len();
+    // Put the Vec back into bufs for capacity reuse on next call.
+    bufs.edges = edges;
+    count
 }
 
 /// Build a leaf using 1-bit quantized vectors with Hamming distance.
