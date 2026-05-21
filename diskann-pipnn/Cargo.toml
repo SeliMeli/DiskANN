@@ -25,6 +25,11 @@ criterion = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+default = []
+# Use native libxsmm GEMM (Intel JIT) for partition + leaf k-NN. x86_64 only.
+libxsmm = ["diskann-linalg/libxsmm"]
+
 [lints]
 workspace = true
 

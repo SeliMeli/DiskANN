@@ -53,6 +53,10 @@ half = { workspace = true, features = ["rand_distr", "num-traits"] }
 [features]
 default = []
 
+# Use native libxsmm GEMM (Intel JIT) for PiPNN's partition + leaf k-NN
+# instead of faer. x86_64 only. Requires `libxsmm-dev` installed system-wide.
+libxsmm = ["diskann-pipnn/libxsmm"]
+
 # Enable spherical-quantization based algorithms
 spherical-quantization = []
 

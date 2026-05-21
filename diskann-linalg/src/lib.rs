@@ -6,8 +6,17 @@
 pub mod common;
 pub use common::Transpose;
 
+mod alternates;
 mod faer;
-use faer::{random_distance_preserving_matrix_impl, sgemm_impl, svd_into_impl};
+// `svd_into_impl` and `random_distance_preserving_matrix_impl` stay on faer (libxsmm
+// only provides GEMM). For sgemm: select libxsmm when the feature is enabled.
+use faer::{random_distance_preserving_matrix_impl, svd_into_impl};
+
+#[cfg(feature = "libxsmm")]
+use alternates::libxsmm::sgemm_impl;
+#[cfg(not(feature = "libxsmm"))]
+use faer::sgemm_impl;
+
 use rand::Rng;
 
 // Make the reference implementation available for internal testing.

@@ -3,7 +3,14 @@
  * Licensed under the MIT license.
  */
 
-//! This module contains alternate linear algebra implementations via Intel MKL.
+//! This module contains alternate linear algebra implementations.
+//!
+//! # Active alternates
+//!
+//! - `libxsmm`: native Intel libxsmm GEMM (hand-written FFI, no wrapper crate).
+//!   Enabled via the `libxsmm` Cargo feature; requires `libxsmm-dev` on Linux.
+//!
+//! # MKL via Intel MKL
 //!
 //! # Why this module is not published by default
 //!
@@ -23,3 +30,6 @@
 //! lapacke = { version = "0.5.0", optional = true }
 //! intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-seq"], optional = true }
 //! ```
+
+#[cfg(feature = "libxsmm")]
+pub(crate) mod libxsmm;

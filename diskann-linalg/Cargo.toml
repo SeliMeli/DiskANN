@@ -14,6 +14,12 @@ thiserror.workspace = true
 rand_distr.workspace = true
 rand.workspace = true
 
+[features]
+default = []
+# Use native libxsmm bindings (Intel JIT GEMM) instead of faer. Requires
+# `libxsmm-dev` installed (static archive at /usr/lib/libxsmm.a). x86_64 only.
+libxsmm = []
+
 [lints]
 clippy.undocumented_unsafe_blocks = "warn"
 clippy.uninlined_format_args = "allow"
