@@ -12,12 +12,13 @@
 //! 3. Merging edges from overlapping partitions using HashPrune (LSH-based online pruning)
 
 pub mod builder;
+pub mod candidate_pool;
 pub mod gemm;
 pub mod hash_prune;
 pub mod leaf_build;
 pub mod partition;
-pub mod partition_v2;
 pub mod profile;
+pub mod prune;
 pub mod quantize;
 
 use diskann_vector::distance::Metric;
@@ -73,6 +74,49 @@ mod metric_serde {
 }
 
 /// Configuration for the PiPNN index builder.
+fn default_leader_cap() -> usize { 1000 }
+fn default_true() -> bool { true }
+fn default_merge_l_max() -> usize { 256 }
+
+/// Cross-leaf merge strategy for the RobustPrune leaf modes (ignored for `Baseline`,
+/// which always uses HashPrune). Lets leaf candidates feed either the bounded HashPrune
+/// reservoir (the paper's design — memory = npoints × l_max regardless of fanout) or an
+/// accumulator (keeps more candidates at higher memory). `Accumulate` is the default so
+/// existing RobustPrune-merge configs keep their behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MergeMode {
+    /// Stream leaf candidates into the bounded HashPrune reservoir, then optional final prune.
+    HashPrune,
+    /// Accumulate per source (bounded by `merge_l_max`, 0 = unbounded), then final RobustPrune.
+    #[default]
+    Accumulate,
+}
+
+/// Leaf-build + cross-leaf merge strategy.
+///
+/// `Baseline` is the production path (GEMM top-k leaf k-NN → HashPrune reservoir merge).
+/// The two RobustPrune variants (experimental) replace HashPrune entirely: each leaf
+/// runs Vamana's RobustPrune per point, the pruned edges accumulate per source
+/// ([`candidate_pool`]), and a single final RobustPrune ([`prune`]) produces the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LeafPruneMode {
+    /// Production: GEMM top-k leaf k-NN → HashPrune reservoir merge.
+    #[default]
+    Baseline,
+    /// Exp 1: all-to-all RobustPrune in leaf (no GEMM) → accumulate → final RobustPrune.
+    RobustNoGemm,
+    /// Exp 2: GEMM top-`k` (k ≫ 2) → RobustPrune in leaf → accumulate → final RobustPrune.
+    GemmTopKRobust,
+    /// Bi-directed k-NN leaf (identical to `Baseline`) but routable to either merge via
+    /// `merge_mode` — so the SAME leaf candidates can feed HashPrune vs accumulate+RobustPrune
+    /// for a clean iso-leaf, iso-output-degree merge comparison.
+    KnnBidir,
+    /// Control (paper's bi-directed-kNN style): GEMM top-`k`, NO leaf prune → accumulate →
+    /// single final RobustPrune. Isolates whether RobustPrune *in the leaf* hurts (the paper
+    /// claims it produces excessively dense candidate lists).
+    GemmTopKNoPrune,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiPNNConfig {
     /// Number of LSH hyperplanes for HashPrune.
@@ -104,6 +148,29 @@ pub struct PiPNNConfig {
     /// Number of threads to use. 0 means use all available cores.
     #[serde(default)]
     pub num_threads: usize,
+    /// Maximum leaders per partition level. Default: 1000 (paper recommendation).
+    #[serde(default = "default_leader_cap")]
+    pub leader_cap: usize,
+    /// Whether to saturate after final prune (fill remaining degree slots with
+    /// closest non-selected candidates). Default: true.
+    #[serde(default = "default_true")]
+    pub saturate_after_prune: bool,
+    /// Leaf-build + merge strategy (experiment selector). Default: `Baseline`.
+    #[serde(default)]
+    pub leaf_prune_mode: LeafPruneMode,
+    /// For the RobustPrune merge modes: per-source candidate accumulator cap
+    /// (closest-by-distance, deduped). 0 = unbounded (faithful "keep all candidates",
+    /// memory-heavy — run behind the RSS watchdog). Default: 256.
+    #[serde(default = "default_merge_l_max")]
+    pub merge_l_max: usize,
+    /// Merge strategy for RobustPrune leaf modes: feed bounded HashPrune (paper design) or
+    /// accumulate. Ignored for `Baseline`. Default: `Accumulate`.
+    #[serde(default)]
+    pub merge_mode: MergeMode,
+    /// Per-leaf RobustPrune target degree (candidates kept per point in each leaf before
+    /// merge). 0 = use `max_degree`. Lets you keep e.g. 128 leaf candidates feeding the merge.
+    #[serde(default)]
+    pub leaf_prune_degree: usize,
 }
 
 impl PiPNNConfig {
@@ -188,6 +255,12 @@ impl Default for PiPNNConfig {
             final_prune: false,
             alpha: 1.2,
             num_threads: 0,
+            leader_cap: 1000,
+            saturate_after_prune: true,
+            leaf_prune_mode: LeafPruneMode::Baseline,
+            merge_l_max: 256,
+            merge_mode: MergeMode::Accumulate,
+            leaf_prune_degree: 0,
         }
     }
 }

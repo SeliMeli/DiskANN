@@ -14,6 +14,28 @@ use serde::{Deserialize, Serialize};
 /// - `Vamana`: The default incremental insert + prune algorithm.
 /// - `PiPNN`: Partition-based batch builder (arXiv:2602.21247).
 ///   Significantly faster build times at comparable graph quality.
+/// Mirrors `diskann_pipnn::LeafPruneMode` (kept local so the always-present PiPNN
+/// variant fields don't depend on the optional `pipnn` feature). See that enum for docs.
+/// `Baseline` = production HashPrune; the others are the RobustPrune-merge experiments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeafPruneMode {
+    #[default]
+    Baseline,
+    RobustNoGemm,
+    GemmTopKRobust,
+    GemmTopKNoPrune,
+    KnnBidir,
+}
+
+/// Mirrors `diskann_pipnn::MergeMode`. `Accumulate` is the default (preserves existing
+/// RobustPrune-merge configs); `HashPrune` feeds leaf candidates into the bounded reservoir.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeMode {
+    HashPrune,
+    #[default]
+    Accumulate,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "algorithm")]
 pub enum BuildAlgorithm {
@@ -50,6 +72,24 @@ pub enum BuildAlgorithm {
         /// Whether to apply a final RobustPrune pass.
         #[serde(default)]
         final_prune: bool,
+        /// Maximum leaders per partition level. Default: 1000.
+        #[serde(default = "default_leader_cap")]
+        leader_cap: usize,
+        /// Whether to saturate after final prune. Default: true.
+        #[serde(default = "default_true")]
+        saturate_after_prune: bool,
+        /// Leaf-build + merge strategy (experiment selector). Default: Baseline.
+        #[serde(default)]
+        leaf_prune_mode: LeafPruneMode,
+        /// RobustPrune-merge per-source accumulator cap (0 = unbounded). Default: 256.
+        #[serde(default = "default_merge_l_max")]
+        merge_l_max: usize,
+        /// Merge strategy for RobustPrune leaf modes (HashPrune | Accumulate). Default: Accumulate.
+        #[serde(default)]
+        merge_mode: MergeMode,
+        /// Per-leaf RobustPrune target degree (0 = use max_degree). Default: 0.
+        #[serde(default)]
+        leaf_prune_degree: usize,
     },
 }
 
@@ -95,6 +135,12 @@ impl BuildAlgorithm {
                 l_max,
                 num_hash_planes,
                 final_prune,
+                leader_cap,
+                saturate_after_prune,
+                leaf_prune_mode,
+                merge_l_max,
+                merge_mode,
+                leaf_prune_degree,
             } => Some(diskann_pipnn::PiPNNConfig {
                 c_max: *c_max,
                 c_min: *c_min,
@@ -109,6 +155,21 @@ impl BuildAlgorithm {
                 final_prune: *final_prune,
                 alpha,
                 num_threads,
+                leader_cap: *leader_cap,
+                saturate_after_prune: *saturate_after_prune,
+                leaf_prune_mode: match leaf_prune_mode {
+                    LeafPruneMode::Baseline => diskann_pipnn::LeafPruneMode::Baseline,
+                    LeafPruneMode::RobustNoGemm => diskann_pipnn::LeafPruneMode::RobustNoGemm,
+                    LeafPruneMode::GemmTopKRobust => diskann_pipnn::LeafPruneMode::GemmTopKRobust,
+                    LeafPruneMode::GemmTopKNoPrune => diskann_pipnn::LeafPruneMode::GemmTopKNoPrune,
+                    LeafPruneMode::KnnBidir => diskann_pipnn::LeafPruneMode::KnnBidir,
+                },
+                merge_l_max: *merge_l_max,
+                merge_mode: match merge_mode {
+                    MergeMode::HashPrune => diskann_pipnn::MergeMode::HashPrune,
+                    MergeMode::Accumulate => diskann_pipnn::MergeMode::Accumulate,
+                },
+                leaf_prune_degree: *leaf_prune_degree,
             }),
             _ => None,
         }
@@ -138,6 +199,15 @@ fn default_l_max() -> usize {
 }
 fn default_num_hash_planes() -> usize {
     12
+}
+fn default_leader_cap() -> usize {
+    1000
+}
+fn default_true() -> bool {
+    true
+}
+fn default_merge_l_max() -> usize {
+    256
 }
 
 #[cfg(test)]
@@ -173,6 +243,12 @@ mod tests {
             l_max: 256,
             num_hash_planes: 12,
             final_prune: false,
+            leader_cap: 1000,
+            saturate_after_prune: true,
+            leaf_prune_mode: LeafPruneMode::Baseline,
+            merge_l_max: 256,
+            merge_mode: MergeMode::Accumulate,
+            leaf_prune_degree: 0,
         };
         let display = format!("{}", algo);
         assert_eq!(
@@ -205,6 +281,12 @@ mod tests {
             l_max: 256,
             num_hash_planes: 8,
             final_prune: true,
+            leader_cap: 1000,
+            saturate_after_prune: true,
+            leaf_prune_mode: LeafPruneMode::Baseline,
+            merge_l_max: 256,
+            merge_mode: MergeMode::Accumulate,
+            leaf_prune_degree: 0,
         };
         let json = serde_json::to_string(&algo).expect("serialize PiPNN should succeed");
         let deserialized: BuildAlgorithm =
@@ -232,6 +314,12 @@ mod tests {
             l_max: default_l_max(),
             num_hash_planes: default_num_hash_planes(),
             final_prune: false,
+            leader_cap: default_leader_cap(),
+            saturate_after_prune: default_true(),
+            leaf_prune_mode: LeafPruneMode::default(),
+            merge_l_max: default_merge_l_max(),
+            merge_mode: MergeMode::default(),
+            leaf_prune_degree: 0,
         };
         assert_eq!(
             deserialized, expected,
@@ -255,6 +343,12 @@ mod tests {
             l_max: 128,
             num_hash_planes: 12,
             final_prune: false,
+            leader_cap: 1000,
+            saturate_after_prune: true,
+            leaf_prune_mode: LeafPruneMode::Baseline,
+            merge_l_max: 256,
+            merge_mode: MergeMode::Accumulate,
+            leaf_prune_degree: 0,
         };
         let p2 = p1.clone();
         assert_eq!(p1, p2, "cloned PiPNN should equal original");
@@ -271,6 +365,12 @@ mod tests {
             l_max: 128,
             num_hash_planes: 12,
             final_prune: false,
+            leader_cap: 1000,
+            saturate_after_prune: true,
+            leaf_prune_mode: LeafPruneMode::Baseline,
+            merge_l_max: 256,
+            merge_mode: MergeMode::Accumulate,
+            leaf_prune_degree: 0,
         };
         assert_ne!(p1, p3, "PiPNN with different c_max should not be equal");
     }
@@ -297,6 +397,12 @@ mod tests {
             l_max: 128,
             num_hash_planes: 12,
             final_prune: true,
+            leader_cap: 1000,
+            saturate_after_prune: true,
+            leaf_prune_mode: LeafPruneMode::Baseline,
+            merge_l_max: 256,
+            merge_mode: MergeMode::Accumulate,
+            leaf_prune_degree: 0,
         };
         let config = algo.to_pipnn_config(64, diskann_vector::distance::Metric::L2, 1.2, 16);
         assert!(config.is_some());

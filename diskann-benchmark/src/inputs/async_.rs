@@ -548,6 +548,14 @@ impl PiPNNInmemConfig {
             final_prune: self.final_prune,
             alpha: parent.alpha,
             num_threads: parent.num_threads,
+            leader_cap: 1000,
+            saturate_after_prune: true,
+            // In-memory benchmark path keeps the production HashPrune merge; the
+            // RobustPrune-merge experiments are driven via the disk-index path.
+            leaf_prune_mode: diskann_pipnn::LeafPruneMode::Baseline,
+            merge_l_max: 256,
+            merge_mode: diskann_pipnn::MergeMode::Accumulate,
+            leaf_prune_degree: 0,
         }
     }
 }

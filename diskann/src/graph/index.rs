@@ -55,6 +55,18 @@ use crate::{
     },
 };
 
+// Diagnostics for the experimental HashPrune-in-Vamana occlude branch: total
+// time, candidate-pool size, and produced degree, summed across all calls and
+// threads. Printed by `disable_hashprune` (called once at final-prune time).
+pub(crate) static HP_OCCLUDE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HP_OCCLUDE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HP_POOL_SUM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HP_DST_SUM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct DiskANNIndex<DP: DataProvider> {
     /// Index config
@@ -63,6 +75,18 @@ pub struct DiskANNIndex<DP: DataProvider> {
     /// The data provider.
     pub data_provider: DP,
     scratch_pool: ObjectPool<SearchScratch<DP::InternalId>>,
+    /// Optional LSH sketches for the experimental HashPrune neighbor selection. Installed via
+    /// [`Self::set_lsh`]; sketches filled incrementally at insert. `occlude_list` uses it when
+    /// `hashprune_active` is set. Empty / inactive ⇒ standard RobustPrune.
+    lsh: std::sync::OnceLock<std::sync::Arc<crate::graph::hashprune::LshState>>,
+    /// Persistent per-node HashPrune reservoirs for the online edge-merge path. When
+    /// `hashprune_active`, every forward/back edge is absorbed via `add_edge` (bounded, no
+    /// occlude, no re-prune); the node's adjacency is the reservoir drained. Installed alongside
+    /// [`Self::set_lsh`].
+    online_hp: std::sync::OnceLock<std::sync::Arc<crate::graph::hash_prune_reservoir::OnlineHashPrune>>,
+    /// Whether the build absorbs edges through HashPrune reservoirs. Toggled off (via
+    /// [`Self::disable_hashprune`]) for the final prune so it runs true RobustPrune.
+    hashprune_active: std::sync::atomic::AtomicBool,
 }
 
 /// Decision returned by [`QueryLabelProvider::on_visit`] to control search traversal.
@@ -239,6 +263,62 @@ where
             config,
             data_provider,
             scratch_pool,
+            lsh: std::sync::OnceLock::new(),
+            online_hp: std::sync::OnceLock::new(),
+            hashprune_active: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Install LSH sketch state for the experimental HashPrune neighbor selection and activate it.
+    /// Idempotent (the underlying `OnceLock` keeps the first state).
+    pub fn set_lsh(&self, lsh: std::sync::Arc<crate::graph::hashprune::LshState>) {
+        let _ = self.lsh.set(lsh);
+        self.hashprune_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get the installed LSH state, if any.
+    pub fn lsh(&self) -> Option<std::sync::Arc<crate::graph::hashprune::LshState>> {
+        self.lsh.get().cloned()
+    }
+
+    /// Install the persistent per-node HashPrune reservoirs (online edge-merge). Idempotent.
+    pub fn set_online_hp(
+        &self,
+        hp: std::sync::Arc<crate::graph::hash_prune_reservoir::OnlineHashPrune>,
+    ) {
+        let _ = self.online_hp.set(hp);
+    }
+
+    /// Get the installed online HashPrune reservoirs, if any.
+    pub fn online_hp(
+        &self,
+    ) -> Option<std::sync::Arc<crate::graph::hash_prune_reservoir::OnlineHashPrune>> {
+        self.online_hp.get().cloned()
+    }
+
+    /// Turn off HashPrune selection so subsequent prunes (e.g. the final prune) use RobustPrune.
+    pub fn disable_hashprune(&self) {
+        self.hashprune_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let calls = HP_OCCLUDE_CALLS.load(Relaxed);
+        if calls > 0 {
+            let nanos = HP_OCCLUDE_NANOS.load(Relaxed);
+            let pool_sum = HP_POOL_SUM.load(Relaxed);
+            let dst_sum = HP_DST_SUM.load(Relaxed);
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(16)
+                .max(1) as f64;
+            eprintln!(
+                "  HASHPRUNE OCCLUDE diag: {calls} calls | occlude CPU-time {:.1}s (~{:.1}s wall at {} threads) | avg pool {:.1} | avg produced degree {:.1}",
+                nanos as f64 / 1e9,
+                nanos as f64 / 1e9 / threads,
+                threads as usize,
+                pool_sum as f64 / calls as f64,
+                dst_sum as f64 / calls as f64,
+            );
         }
     }
 
@@ -2553,6 +2633,30 @@ where
                 .prune_accessor(&self.data_provider, context)
                 .into_ann_result()?;
 
+            // Online HashPrune (back-edges): the symmetric back-edges were ALREADY inserted into
+            // `source`'s reservoir by the forward prune (which held dist(p,fi) = dist(fi,p)). So
+            // here we just drain and set source's adjacency — no fill_set, no distance recompute,
+            // no re-prune. (Deletes use the normal path; HashPrune only governs the build.)
+            if to_remove.is_none()
+                && self
+                    .hashprune_active
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let hp = self
+                    .online_hp
+                    .get()
+                    .expect("hashprune_active set without online_hp state");
+                let src_usize = source.into_usize();
+                let mut adj = AdjacencyList::with_capacity(hp.l_max());
+                for (id, _d) in hp.get_neighbors(src_usize, hp.l_max()) {
+                    if let Some(iid) = <DP::InternalId as num_traits::FromPrimitive>::from_u32(id) {
+                        adj.push(iid);
+                    }
+                }
+                accessor.set_neighbors(source, &adj).await?;
+                return Ok(());
+            }
+
             let mut adj_list = AdjacencyList::with_capacity(self.max_degree_with_slack());
             accessor.get_neighbors(source, &mut adj_list).await?;
 
@@ -2651,6 +2755,7 @@ where
             // Note: Turbofish needed to help inference.
             self.occlude_list::<A::Extended, _, _>(
                 &accessor.build_distance_computer().into_ann_result()?,
+                location,
                 &mut context,
                 working_set,
                 |id| id == location,
@@ -2728,6 +2833,7 @@ where
             // Note: Turbofish needed to help inference.
             self.occlude_list::<A::Extended, _, _>(
                 &computer,
+                location,
                 &mut scratch.as_context(self.max_occlusion_size()),
                 working_set,
                 |id| id == location,
@@ -2772,6 +2878,7 @@ where
     fn occlude_list<V, C, F>(
         &self,
         computer: &C,
+        location: DP::InternalId,
         context: &mut prune::Context<'_, DP::InternalId>,
         map: &HashMap<DP::InternalId, V>,
         exclude: F,
@@ -2786,6 +2893,63 @@ where
         F: Fn(DP::InternalId) -> bool,
     {
         if context.pool.is_empty() {
+            return;
+        }
+
+        // Experimental HashPrune neighbor selection: instead of RobustPrune occlusion, keep the
+        // closest candidate per LSH angular bucket (relative to `location`) up to the degree
+        // budget, optionally saturating with the next-closest. Pool is sorted by distance
+        // ascending, so the first candidate seen per bucket is the closest.
+        if self
+            .hashprune_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let hp_start = std::time::Instant::now();
+            let lsh = self
+                .lsh
+                .get()
+                .expect("hashprune_active set without lsh state");
+            let hp = self
+                .online_hp
+                .get()
+                .expect("hashprune_active set without online_hp state");
+            // Drain the adjacency to l_max: the live graph is l_max-wide, which is what gives
+            // higher recall at higher l_max (and the build cost that comes with it). Sweeping
+            // l_max maps that build<->recall tradeoff.
+            let degree = hp.l_max();
+            let loc = location.into_usize();
+            let prune::Context {
+                pool,
+                neighbors: dst,
+                ..
+            } = &mut *context;
+            // Online HashPrune (forward): absorb every greedy-search candidate into `loc`'s
+            // PERSISTENT reservoir via add_edge (find_hash + farthest-eviction, bounded at l_max).
+            // No occlusion, no saturate, no re-prune — the drained reservoir IS loc's adjacency.
+            let pool_len = pool.len();
+            for neighbor in pool.iter() {
+                if exclude(neighbor.id) {
+                    continue;
+                }
+                let h = lsh.relative_hash(loc, neighbor.id.into_usize());
+                hp.add_edge(loc, neighbor.id.into_usize() as u32, h, neighbor.distance);
+            }
+            dst.clear();
+            for (fid, d) in hp.get_neighbors(loc, degree) {
+                if let Some(iid) = <DP::InternalId as num_traits::FromPrimitive>::from_u32(fid) {
+                    dst.push(iid);
+                }
+                // Carry the distance to the symmetric back-edge: insert loc into fid's reservoir
+                // now, with dist(loc,fid)=dist(fid,loc) already in hand. `add_edge_and_prune(fid)`
+                // then just drains fid's reservoir instead of recomputing the distance.
+                let h_back = lsh.relative_hash(fid as usize, loc);
+                hp.add_edge(fid as usize, loc as u32, h_back, d);
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            HP_OCCLUDE_NANOS.fetch_add(hp_start.elapsed().as_nanos() as u64, Relaxed);
+            HP_OCCLUDE_CALLS.fetch_add(1, Relaxed);
+            HP_POOL_SUM.fetch_add(pool_len as u64, Relaxed);
+            HP_DST_SUM.fetch_add(dst.len() as u64, Relaxed);
             return;
         }
 

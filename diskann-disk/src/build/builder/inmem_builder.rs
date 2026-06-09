@@ -92,6 +92,33 @@ pub(super) trait InmemIndexBuilder<T: Sized>: Send + Sync {
     fn count_reachable_nodes(&self) -> Pin<Box<dyn SendFuture<ANNResult<usize>> + '_>>;
 }
 
+/// Experimental: number of LSH planes for HashPrune-in-Vamana (env `VAMANA_HASHPRUNE_PLANES`).
+/// 0 (default) ⇒ standard RobustPrune. Read once and cached.
+fn vamana_hashprune_planes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("VAMANA_HASHPRUNE_PLANES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Experimental: HashPrune reservoir size for Vamana (env `VAMANA_HASHPRUNE_LMAX`). 0 ⇒ use
+/// `pruned_degree`. When > pruned_degree, the build keeps l_max diverse neighbors per node and the
+/// final RobustPrune cuts to pruned_degree.
+fn vamana_hashprune_lmax() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("VAMANA_HASHPRUNE_LMAX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 //////////////////////////////////
 // FullPrecision Implementation //
 //////////////////////////////////
@@ -119,6 +146,51 @@ where
         vector: &'a [T],
     ) -> Pin<Box<dyn SendFuture<ANNResult<()>> + 'a>> {
         Box::pin(async move {
+            // Experimental: when VAMANA_HASHPRUNE_PLANES>0, compute this node's LSH sketch so
+            // occlude_list selects neighbors via HashPrune buckets instead of RobustPrune.
+            let planes = vamana_hashprune_planes();
+            if planes > 0 {
+                if self.lsh().is_none() {
+                    // Must cover every node id (0..total_points). `capacity()` is the current
+                    // (growing, often 2^k) allocation and is too small mid-build — that silently
+                    // gave LshState hash-0 for tail nodes and panics OnlineHashPrune. Size to the
+                    // declared total.
+                    let cap = self.total_points().max(self.provider().capacity());
+                    eprintln!(
+                        "  HASHPRUNE sizing: total_points={} capacity={} -> cap={}",
+                        self.total_points(),
+                        self.provider().capacity(),
+                        cap
+                    );
+                    // HashPrune reservoir size: VAMANA_HASHPRUNE_LMAX if set, else pruned_degree.
+                    let env_lmax = vamana_hashprune_lmax();
+                    let l_max = if env_lmax > 0 {
+                        env_lmax
+                    } else {
+                        self.config.pruned_degree().get()
+                    };
+                    self.set_lsh(std::sync::Arc::new(
+                        diskann::graph::hashprune::LshState::new(
+                            planes,
+                            vector.len(),
+                            cap,
+                            l_max,
+                            42,
+                        ),
+                    ));
+                    // Persistent per-node reservoirs: every forward/back edge is absorbed online
+                    // via add_edge (bounded at l_max), so the build never re-prunes.
+                    self.set_online_hp(std::sync::Arc::new(
+                        diskann::graph::hash_prune_reservoir::OnlineHashPrune::new(cap, l_max),
+                    ));
+                }
+                if let Some(lsh) = self.lsh() {
+                    let mut buf = vec![0.0f32; vector.len()];
+                    if T::as_f32_into(vector, &mut buf).is_ok() {
+                        lsh.set_sketch(id as usize, &buf);
+                    }
+                }
+            }
             self.insert(FullPrecision, &DefaultContext, &id, vector)
                 .await
         })
@@ -129,6 +201,8 @@ where
         range: core::ops::Range<u32>,
     ) -> Pin<Box<dyn SendFuture<ANNResult<()>> + '_>> {
         Box::pin(async move {
+            // Keep the final prune as true RobustPrune even when HashPrune was used at insert.
+            self.disable_hashprune();
             self.prune_range(&FullPrecision, &DefaultContext, range)
                 .await
         })

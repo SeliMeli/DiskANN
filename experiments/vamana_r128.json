@@ -1,0 +1,53 @@
+{
+  "search_directories": [
+    "datasets"
+  ],
+  "output_directory": null,
+  "jobs": [
+    {
+      "type": "disk-index",
+      "content": {
+        "source": {
+          "disk-index-source": "Build",
+          "data_type": "float16",
+          "data": "enron_fp16.bin",
+          "distance": "cosine_normalized",
+          "dim": 384,
+          "max_degree": 128,
+          "l_build": 128,
+          "num_threads": 16,
+          "build_ram_limit_gb": 64,
+          "num_pq_chunks": 192,
+          "quantization_type": "FP",
+          "build_algorithm": {
+            "algorithm": "Vamana"
+          },
+          "save_path": "experiments/idx/vamana_r128"
+        },
+        "search_phase": {
+          "queries": "enron_query_fp16.bin",
+          "groundtruth": "enron_gt.bin",
+          "num_threads": 16,
+          "beam_width": 4,
+          "search_list": [
+            10,
+            15,
+            20,
+            30,
+            40,
+            60,
+            80,
+            120,
+            160
+          ],
+          "recall_at": 10,
+          "is_flat_search": false,
+          "distance": "cosine_normalized",
+          "vector_filters_file": null,
+          "num_nodes_to_cache": null,
+          "search_io_limit": null
+        }
+      }
+    }
+  ]
+}

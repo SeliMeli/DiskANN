@@ -53,6 +53,63 @@ impl fmt::Display for DiskBuildStats {
     }
 }
 
+fn peak_rss_mb() -> f64 {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                pmc: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        unsafe {
+            let mut pmc = std::mem::MaybeUninit::<ProcessMemoryCounters>::zeroed().assume_init();
+            pmc.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                return pmc.peak_working_set_size as f64 / (1024.0 * 1024.0);
+            }
+        }
+        0.0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // VmHWM = peak resident set size (RSS high-water mark). This is what the
+        // OOM killer reacts to and what /usr/bin/time reports as "Maximum resident
+        // set size". Earlier versions read VmPeak (peak virtual address space),
+        // which over-counts pages that were reserved but never physically committed
+        // (e.g., faer's lazy thread-local scratch via `Vec::with_capacity().set_len()`).
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmHWM:") {
+                    if let Some(kb) = line.split_whitespace().nth(1) {
+                        if let Ok(kb) = kb.parse::<f64>() {
+                            return kb / 1024.0;
+                        }
+                    }
+                }
+            }
+        }
+        0.0
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    { 0.0 }
+}
+
 pub(super) fn build_disk_index<T, StorageProviderType>(
     storage_provider: &StorageProviderType,
     params: &DiskIndexBuild,
@@ -76,9 +133,25 @@ where
     }
 
     let metric: Metric = params.distance.into();
+    // Experimental: for HashPrune-in-Vamana, the build graph must hold the HashPrune reservoir
+    // size (l_max) per node while the final RobustPrune cuts to pruned_degree (= max_degree). So
+    // widen the graph storage to l_max when VAMANA_HASHPRUNE_LMAX exceeds the default slack.
+    let hp_lmax = std::env::var("VAMANA_HASHPRUNE_LMAX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let max_degree_setting = if hp_lmax > params.max_degree {
+        // The graph cap must be l_max PLUS slack headroom: HashPrune saturates each node to
+        // ~l_max, so without slack the node sits exactly at the cap and every reverse edge
+        // triggers a re-prune (a re-prune storm — ~40 occludes/insert at l_max=128). Apply the
+        // same 1.3× slack DiskANN uses by default so reverse edges accumulate before re-pruning.
+        config::MaxDegree::new((hp_lmax * 13 / 10).max(hp_lmax + 1))
+    } else {
+        config::MaxDegree::default_slack()
+    };
     let config = config::Builder::new_with(
         params.max_degree,
-        config::MaxDegree::default_slack(),
+        max_degree_setting,
         params.l_build,
         metric.into(),
         |b| {
@@ -130,6 +203,8 @@ where
     let start = std::time::Instant::now();
     disk_index.build()?;
     let total_time: MicroSeconds = start.elapsed().into();
+
+    println!("Peak RSS: {:.1} MB", peak_rss_mb());
 
     drop(span);
     let span_metrics = if let Some((collector, provider)) = span_collector {

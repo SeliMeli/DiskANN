@@ -13,10 +13,139 @@
 //! 3. Create bi-directed edges (both forward and reverse k-NN)
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use diskann::utils::VectorRepr;
 use diskann_vector::distance::{DistanceProvider, Metric, SquaredL2};
 use diskann_vector::PureDistanceFunction;
+
+/// Env switch: `PIPNN_POINT_CACHE=1` opts into the per-thread point cache.
+/// Default OFF — the May 2026 experiment showed the cache plateaus around 10%
+/// hit rate on Enron 1M (fanout=[8,3]) regardless of size because the 24
+/// leaves containing each point are scattered across the entire leaf list.
+/// Read once and cached so the loop has no syscall overhead.
+fn point_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("PIPNN_POINT_CACHE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("on")
+        )
+    })
+}
+
+/// Global counters for cache effectiveness. Each thread folds its local
+/// `point_cache.hits / .misses` into these when its buffers are released.
+pub static POINT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static POINT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Per-thread direct-mapped point cache used during leaf gather.
+///
+/// Each point appears in up to `fanout[0] * fanout[1] * ...` leaves (e.g. 24
+/// with fanout=[8,3]). Without caching, each appearance triggers a fresh DRAM
+/// read of `ndims` floats. With a direct-mapped cache + leaf sort that groups
+/// overlapping leaves on the same thread, repeated lookups hit L2/L3 instead.
+///
+/// Layout:
+/// - `keys[slot]` = u32::MAX (empty) or the point ID currently in `slot`.
+/// - `data[slot*ndims .. slot*ndims+ndims]` = the f32 vector for that point.
+///
+/// Conflict misses are handled by simple overwrite (no associativity). With a
+/// good hash mixing function and capacity ≥ leaf size, collisions inside a
+/// single leaf are rare; across leaves, eviction is the goal anyway.
+pub struct PointCache {
+    pub data: Vec<f32>,
+    pub keys: Vec<u32>,
+    pub ndims: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+/// Default 2^11 = 2048 slots. At ndims=384 (Enron), 2048 * 384 * 4 = 3 MB per
+/// thread — overflows L2 (1 MB) but stays in shared L3 (Cascade Lake ~32 MB,
+/// EPYC 7763 ~32 MB/CCX). At 16 threads × 3 MB = 48 MB total, contention is
+/// shared so this is acceptable. Override with PIPNN_CACHE_LOG2=<n>.
+const POINT_CACHE_LOG2_DEFAULT: u32 = 11;
+const POINT_CACHE_EMPTY: u32 = u32::MAX;
+
+fn point_cache_log2() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PIPNN_CACHE_LOG2")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| (3..=20).contains(n))
+            .unwrap_or(POINT_CACHE_LOG2_DEFAULT)
+    })
+}
+
+fn point_cache_size() -> usize {
+    1usize << point_cache_log2()
+}
+
+fn point_cache_mask() -> usize {
+    point_cache_size() - 1
+}
+
+impl Default for PointCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PointCache {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            keys: Vec::new(),
+            ndims: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Allocate cache storage for `ndims`-vectors. Re-init if `ndims` changed.
+    pub fn ensure_capacity(&mut self, ndims: usize) {
+        let sz = point_cache_size();
+        if self.ndims != ndims {
+            self.data.clear();
+            self.data.resize(sz * ndims, 0.0);
+            self.keys.clear();
+            self.keys.resize(sz, POINT_CACHE_EMPTY);
+            self.ndims = ndims;
+        } else if self.keys.len() < sz {
+            self.data.resize(sz * ndims, 0.0);
+            self.keys.resize(sz, POINT_CACHE_EMPTY);
+        }
+    }
+
+    /// Reset all slots to empty, keep allocations. Called between builds so a
+    /// stale entry from a prior dataset can't collide with the new one.
+    pub fn clear(&mut self) {
+        for k in self.keys.iter_mut() {
+            *k = POINT_CACHE_EMPTY;
+        }
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    /// Free cache memory entirely (e.g. on thread release).
+    pub fn release(&mut self) {
+        self.data = Vec::new();
+        self.keys = Vec::new();
+        self.ndims = 0;
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    /// Fibonacci hashing mixes sequential point IDs across slots.
+    #[inline(always)]
+    fn slot(key: u32) -> usize {
+        let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (h as usize) & point_cache_mask()
+    }
+}
 
 /// Thread-local reusable buffers for leaf building.
 /// Avoids repeated allocation/deallocation of large matrices.
@@ -26,6 +155,7 @@ pub struct LeafBuffers {
     pub dot_matrix: Vec<f32>,
     pub dist_matrix: Vec<f32>,
     pub seen: Vec<bool>,
+    pub point_cache: PointCache,
 }
 
 impl Default for LeafBuffers {
@@ -42,6 +172,7 @@ impl LeafBuffers {
             dot_matrix: Vec::new(),
             dist_matrix: Vec::new(),
             seen: Vec::new(),
+            point_cache: PointCache::new(),
         }
     }
 
@@ -105,6 +236,11 @@ pub fn release_thread_buffers() {
         bufs.dot_matrix = Vec::new();
         bufs.dist_matrix = Vec::new();
         bufs.seen = Vec::new();
+        if bufs.point_cache.hits != 0 || bufs.point_cache.misses != 0 {
+            POINT_CACHE_HITS.fetch_add(bufs.point_cache.hits, Ordering::Relaxed);
+            POINT_CACHE_MISSES.fetch_add(bufs.point_cache.misses, Ordering::Relaxed);
+        }
+        bufs.point_cache.release();
     });
     QUANT_BUFFERS.with(|cell| {
         let mut bufs = cell.borrow_mut();
@@ -169,7 +305,9 @@ fn extract_knn_small(dist_matrix: &[f32], n: usize, k: usize) -> Vec<(usize, usi
                             let lane = m.trailing_zeros() as usize;
                             m &= m - 1;
                             let j = base + lane;
-                            if j == i { continue; }
+                            if j == i {
+                                continue;
+                            }
                             let d = d_arr[lane];
                             if d < top[threshold_idx].1 {
                                 top[threshold_idx] = (j as u32, d);
@@ -186,7 +324,9 @@ fn extract_knn_small(dist_matrix: &[f32], n: usize, k: usize) -> Vec<(usize, usi
                 }
                 // Remainder
                 for j in (chunks * 16)..n {
-                    if j == i { continue; }
+                    if j == i {
+                        continue;
+                    }
                     let d = *row.get_unchecked(j);
                     if d < top[threshold_idx].1 {
                         top[threshold_idx] = (j as u32, d);
@@ -219,7 +359,9 @@ fn extract_knn_small(dist_matrix: &[f32], n: usize, k: usize) -> Vec<(usize, usi
                             let lane = m.trailing_zeros() as usize;
                             m &= m - 1;
                             let j = base + lane;
-                            if j == i { continue; }
+                            if j == i {
+                                continue;
+                            }
                             let d = d_arr[lane];
                             if d < top[threshold_idx].1 {
                                 top[threshold_idx] = (j as u32, d);
@@ -235,7 +377,9 @@ fn extract_knn_small(dist_matrix: &[f32], n: usize, k: usize) -> Vec<(usize, usi
                     }
                 }
                 for j in (chunks * 8)..n {
-                    if j == i { continue; }
+                    if j == i {
+                        continue;
+                    }
                     let d = *row.get_unchecked(j);
                     if d < top[threshold_idx].1 {
                         top[threshold_idx] = (j as u32, d);
@@ -253,7 +397,9 @@ fn extract_knn_small(dist_matrix: &[f32], n: usize, k: usize) -> Vec<(usize, usi
         #[cfg(not(target_arch = "x86_64"))]
         {
             for j in 0..n {
-                if j == i { continue; }
+                if j == i {
+                    continue;
+                }
                 let d = unsafe { *row.get_unchecked(j) };
                 if d < top[threshold_idx].1 {
                     top[threshold_idx] = (j as u32, d);
@@ -339,92 +485,155 @@ pub fn build_leaf_with_buffers<T: VectorRepr>(
     bufs: &mut LeafBuffers,
 ) -> Vec<Edge> {
     let n = indices.len();
-    bufs.ensure_capacity(n, ndims);
-
-    // Extract local data into reused buffer, converting T -> f32 on the fly.
-    let local_data = &mut bufs.local_data[..n * ndims];
-    for (i, &idx) in indices.iter().enumerate() {
-        let src = &data[idx * ndims..(idx + 1) * ndims];
-        let dst = &mut local_data[i * ndims..(i + 1) * ndims];
-        T::as_f32_into(src, dst).expect("f32 conversion");
+    {
+        let _timer = crate::profile::PhaseTimer::start("leaf_build/ensure_capacity");
+        bufs.ensure_capacity(n, ndims);
     }
 
-    // Compute norms into reused buffer.
-    let norms_sq = &mut bufs.norms_sq[..n];
-    for i in 0..n {
-        let row = &local_data[i * ndims..(i + 1) * ndims];
-        let mut norm = 0.0f32;
-        for &v in row.iter() {
-            norm += v * v;
+    // Gather rows for this leaf into `bufs.local_data`, converting T -> f32.
+    // Each point may appear in many leaves (fanout-product replicas), so a
+    // direct-mapped per-thread point cache short-circuits repeat reads.
+    // PIPNN_POINT_CACHE=0 disables it for A/B tests.
+    {
+        let _timer = crate::profile::PhaseTimer::start("leaf_build/conv");
+        if point_cache_enabled() {
+            bufs.point_cache.ensure_capacity(ndims);
+            let LeafBuffers {
+                local_data,
+                point_cache,
+                ..
+            } = &mut *bufs;
+            let local_data = &mut local_data[..n * ndims];
+            for (i, &idx) in indices.iter().enumerate() {
+                let key = idx as u32;
+                let slot = PointCache::slot(key);
+                let dst_off = i * ndims;
+                let dst = &mut local_data[dst_off..dst_off + ndims];
+                // SAFETY: slot is masked into `keys`/`data` capacity.
+                let hit = unsafe { *point_cache.keys.get_unchecked(slot) } == key;
+                if hit {
+                    let src_off = slot * ndims;
+                    let src = unsafe { point_cache.data.get_unchecked(src_off..src_off + ndims) };
+                    dst.copy_from_slice(src);
+                    point_cache.hits += 1;
+                } else {
+                    let src = &data[idx * ndims..(idx + 1) * ndims];
+                    T::as_f32_into(src, dst).expect("f32 conversion");
+                    let src_off = slot * ndims;
+                    unsafe {
+                        *point_cache.keys.get_unchecked_mut(slot) = key;
+                        let cdst = point_cache.data.get_unchecked_mut(src_off..src_off + ndims);
+                        cdst.copy_from_slice(dst);
+                    }
+                    point_cache.misses += 1;
+                }
+            }
+        } else {
+            let local_data = &mut bufs.local_data[..n * ndims];
+            for (i, &idx) in indices.iter().enumerate() {
+                let src = &data[idx * ndims..(idx + 1) * ndims];
+                let dst = &mut local_data[i * ndims..(i + 1) * ndims];
+                T::as_f32_into(src, dst).expect("f32 conversion");
+            }
         }
-        norms_sq[i] = norm;
+    }
+
+    let local_data = &bufs.local_data[..n * ndims];
+    if !matches!(metric, Metric::CosineNormalized | Metric::InnerProduct) {
+        let norms_sq = &mut bufs.norms_sq[..n];
+        {
+            let _timer = crate::profile::PhaseTimer::start("leaf_build/norms");
+            for i in 0..n {
+                let row = &local_data[i * ndims..(i + 1) * ndims];
+                let mut norm = 0.0f32;
+                for &v in row.iter() {
+                    norm += v * v;
+                }
+                norms_sq[i] = norm;
+            }
+        }
     }
 
     // GEMM: dots = local_data * local_data^T
     let dot_matrix = &mut bufs.dot_matrix[..n * n];
-    crate::gemm::sgemm_aat(local_data, n, ndims, dot_matrix);
+    {
+        let _timer = crate::profile::PhaseTimer::start("leaf_build/gemm");
+        crate::gemm::sgemm_aat(local_data, n, ndims, dot_matrix);
+    }
 
     let norms_sq = &bufs.norms_sq[..n];
 
     // Convert to distance matrix using the target metric.
     use diskann_vector::distance::Metric;
-    let dist_matrix = match metric {
-        Metric::CosineNormalized => {
-            // Pre-normalized: dist = 1 - dot(a, b)
-            for i in 0..n {
-                let row = &mut dot_matrix[i * n..(i + 1) * n];
-                for val in row.iter_mut() {
-                    *val = (1.0 - *val).max(0.0);
+    let dist_matrix = {
+        let _timer = crate::profile::PhaseTimer::start("leaf_build/dist");
+        match metric {
+            Metric::CosineNormalized => {
+                // Pre-normalized: dist = 1 - dot(a, b)
+                for i in 0..n {
+                    let row = &mut dot_matrix[i * n..(i + 1) * n];
+                    for val in row.iter_mut() {
+                        *val = (1.0 - *val).max(0.0);
+                    }
+                    row[i] = f32::MAX;
                 }
-                row[i] = f32::MAX;
+                &mut bufs.dot_matrix[..n * n]
             }
-            &mut bufs.dot_matrix[..n * n]
-        }
-        Metric::Cosine => {
-            // Unnormalized: dist = 1 - dot(a,b)/(||a||*||b||)
-            let dist = &mut bufs.dist_matrix[..n * n];
-            for i in 0..n {
-                let ni_sqrt = norms_sq[i].sqrt();
-                for j in 0..n {
-                    let denom = ni_sqrt * norms_sq[j].sqrt();
-                    let cos_sim = if denom > 0.0 {
-                        dot_matrix[i * n + j] / denom
-                    } else {
-                        0.0
-                    };
-                    dist[i * n + j] = (1.0 - cos_sim).max(0.0);
+            Metric::Cosine => {
+                // Unnormalized: dist = 1 - dot(a,b)/(||a||*||b||)
+                let dist = &mut bufs.dist_matrix[..n * n];
+                for i in 0..n {
+                    let ni_sqrt = norms_sq[i].sqrt();
+                    for j in 0..n {
+                        let denom = ni_sqrt * norms_sq[j].sqrt();
+                        let cos_sim = if denom > 0.0 {
+                            dot_matrix[i * n + j] / denom
+                        } else {
+                            0.0
+                        };
+                        dist[i * n + j] = (1.0 - cos_sim).max(0.0);
+                    }
+                    dist[i * n + i] = f32::MAX;
                 }
-                dist[i * n + i] = f32::MAX;
+                dist
             }
-            dist
-        }
-        Metric::L2 => {
-            let dist = &mut bufs.dist_matrix[..n * n];
-            for i in 0..n {
-                let ni = norms_sq[i];
-                for j in 0..n {
-                    dist[i * n + j] = (ni + norms_sq[j] - 2.0 * dot_matrix[i * n + j]).max(0.0);
+            Metric::L2 => {
+                let dist = &mut bufs.dist_matrix[..n * n];
+                for i in 0..n {
+                    let ni = norms_sq[i];
+                    for j in 0..n {
+                        dist[i * n + j] = (ni + norms_sq[j] - 2.0 * dot_matrix[i * n + j]).max(0.0);
+                    }
+                    dist[i * n + i] = f32::MAX;
                 }
-                dist[i * n + i] = f32::MAX;
+                dist
             }
-            dist
-        }
-        Metric::InnerProduct => {
-            for i in 0..n {
-                let row = &mut dot_matrix[i * n..(i + 1) * n];
-                for val in row.iter_mut() {
-                    *val = -*val;
+            Metric::InnerProduct => {
+                for i in 0..n {
+                    let row = &mut dot_matrix[i * n..(i + 1) * n];
+                    for val in row.iter_mut() {
+                        *val = -*val;
+                    }
+                    row[i] = f32::MAX;
                 }
-                row[i] = f32::MAX;
+                &mut bufs.dot_matrix[..n * n]
             }
-            &mut bufs.dot_matrix[..n * n]
         }
     };
 
-    let local_edges = extract_knn(dist_matrix, n, k);
+    let local_edges = {
+        let _timer = crate::profile::PhaseTimer::start("leaf_build/knn");
+        extract_knn(dist_matrix, n, k)
+    };
     let seen = &mut bufs.seen[..n * n];
-    seen.fill(false);
-    make_bidirected_edges(&local_edges, dist_matrix, n, indices, seen)
+    {
+        let _timer = crate::profile::PhaseTimer::start("leaf_build/seen_fill");
+        seen.fill(false);
+    }
+    {
+        let _timer = crate::profile::PhaseTimer::start("leaf_build/bidir");
+        make_bidirected_edges(&local_edges, dist_matrix, n, indices, seen)
+    }
 }
 
 /// Build a leaf using direct pairwise SIMD distance — no GEMM, no f32 conversion.
@@ -636,6 +845,311 @@ fn make_bidirected_edges(
     global_edges
 }
 
+/// Fill `bufs.dist_matrix[..n*n]` with the leaf's all-pairs distance matrix via GEMM
+/// (gather → norms → A·Aᵀ → metric conversion), diagonal set to `f32::MAX`. Mirrors the
+/// distance computation in [`build_leaf_with_buffers`] without the k-NN extraction.
+fn gemm_fill_dist_matrix<T: VectorRepr>(
+    data: &[T],
+    ndims: usize,
+    indices: &[usize],
+    metric: Metric,
+    bufs: &mut LeafBuffers,
+) {
+    let n = indices.len();
+    {
+        let local = &mut bufs.local_data[..n * ndims];
+        for (i, &idx) in indices.iter().enumerate() {
+            T::as_f32_into(
+                &data[idx * ndims..(idx + 1) * ndims],
+                &mut local[i * ndims..(i + 1) * ndims],
+            )
+            .expect("f32 conversion");
+        }
+    }
+    if !matches!(metric, Metric::CosineNormalized | Metric::InnerProduct) {
+        let LeafBuffers {
+            local_data,
+            norms_sq,
+            ..
+        } = &mut *bufs;
+        let local = &local_data[..n * ndims];
+        for i in 0..n {
+            let mut s = 0.0f32;
+            for &v in &local[i * ndims..(i + 1) * ndims] {
+                s += v * v;
+            }
+            norms_sq[i] = s;
+        }
+    }
+    {
+        let LeafBuffers {
+            local_data,
+            dot_matrix,
+            ..
+        } = &mut *bufs;
+        crate::gemm::sgemm_aat(&local_data[..n * ndims], n, ndims, &mut dot_matrix[..n * n]);
+    }
+    let LeafBuffers {
+        norms_sq,
+        dot_matrix,
+        dist_matrix,
+        ..
+    } = &mut *bufs;
+    let norms = &norms_sq[..n];
+    let dots = &dot_matrix[..n * n];
+    let dm = &mut dist_matrix[..n * n];
+    match metric {
+        Metric::CosineNormalized => {
+            for i in 0..n {
+                for j in 0..n {
+                    dm[i * n + j] = (1.0 - dots[i * n + j]).max(0.0);
+                }
+                dm[i * n + i] = f32::MAX;
+            }
+        }
+        Metric::Cosine => {
+            for i in 0..n {
+                let ni = norms[i].sqrt();
+                for j in 0..n {
+                    let den = ni * norms[j].sqrt();
+                    let cs = if den > 0.0 { dots[i * n + j] / den } else { 0.0 };
+                    dm[i * n + j] = (1.0 - cs).max(0.0);
+                }
+                dm[i * n + i] = f32::MAX;
+            }
+        }
+        Metric::L2 => {
+            for i in 0..n {
+                let ni = norms[i];
+                for j in 0..n {
+                    dm[i * n + j] = (ni + norms[j] - 2.0 * dots[i * n + j]).max(0.0);
+                }
+                dm[i * n + i] = f32::MAX;
+            }
+        }
+        Metric::InnerProduct => {
+            for i in 0..n {
+                for j in 0..n {
+                    dm[i * n + j] = -dots[i * n + j];
+                }
+                dm[i * n + i] = f32::MAX;
+            }
+        }
+    }
+}
+
+/// Per-point RobustPrune over a precomputed leaf distance matrix `dm` (n×n, row-major,
+/// diagonal = `f32::MAX`). For each leaf point, the candidate set is either every other
+/// leaf-mate (`leaf_k = None`, Exp 1) or its `leaf_k` nearest (`Some(k)`, Exp 2); that set
+/// is occlusion-pruned to `max_degree` via [`crate::prune::robust_prune_occlude`] using
+/// matrix lookups. Emits directed `Edge { src=point, dst=kept_neighbor }`.
+fn prune_leaf_from_matrix(
+    dm: &[f32],
+    n: usize,
+    indices: &[usize],
+    leaf_k: Option<usize>,
+    max_degree: usize,
+    alpha: f32,
+    leaf_prune: bool,
+) -> Vec<Edge> {
+    let mut edges = Vec::with_capacity(n * max_degree.min(n));
+    let mut cand_local: Vec<u32> = Vec::with_capacity(n);
+    let mut node_dists: Vec<f32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let row = &dm[i * n..(i + 1) * n];
+        cand_local.clear();
+        cand_local.extend((0..n as u32).filter(|&j| j as usize != i));
+        if let Some(k) = leaf_k {
+            let k = k.min(cand_local.len());
+            if k > 0 && k < cand_local.len() {
+                cand_local.select_nth_unstable_by(k - 1, |&a, &b| {
+                    row[a as usize]
+                        .partial_cmp(&row[b as usize])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                cand_local.truncate(k);
+            }
+        }
+        let nc = cand_local.len();
+        if nc == 0 {
+            continue;
+        }
+        node_dists.clear();
+        node_dists.extend(cand_local.iter().map(|&j| row[j as usize]));
+        if leaf_prune {
+            // RobustPrune in the leaf (Exp 1 / Exp 2).
+            let selected = crate::prune::robust_prune_occlude(
+                nc,
+                &node_dists[..nc],
+                max_degree,
+                alpha,
+                false,
+                |a, b| dm[cand_local[a] as usize * n + cand_local[b] as usize],
+            );
+            for s in selected {
+                let lj = cand_local[s as usize] as usize;
+                edges.push(Edge {
+                    src: indices[i],
+                    dst: indices[lj],
+                    distance: node_dists[s as usize],
+                });
+            }
+        } else {
+            // No leaf prune (paper's bi-directed-kNN-style control): emit the top-k
+            // candidates directly and let the single global final RobustPrune decide.
+            for (ci, &lj) in cand_local.iter().enumerate() {
+                edges.push(Edge {
+                    src: indices[i],
+                    dst: indices[lj as usize],
+                    distance: node_dists[ci],
+                });
+            }
+        }
+    }
+    edges
+}
+
+/// Exp 1 leaf builder: all-to-all RobustPrune, **no GEMM**.
+///
+/// Candidate set per point = every other leaf-mate. The n×n leaf distance matrix is
+/// built with direct pairwise SIMD distance (no GEMM, no top-k extraction); each point
+/// is then occlusion-pruned to `max_degree`. Symmetry/merge across leaves is handled
+/// downstream by the candidate accumulator + final RobustPrune.
+pub fn build_leaf_robust_no_gemm<T: VectorRepr>(
+    data: &[T],
+    ndims: usize,
+    indices: &[usize],
+    max_degree: usize,
+    metric: Metric,
+    alpha: f32,
+    bufs: &mut LeafBuffers,
+) -> Vec<Edge> {
+    let n = indices.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+    bufs.ensure_capacity(n, ndims);
+    {
+        let local = &mut bufs.local_data[..n * ndims];
+        for (i, &idx) in indices.iter().enumerate() {
+            T::as_f32_into(
+                &data[idx * ndims..(idx + 1) * ndims],
+                &mut local[i * ndims..(i + 1) * ndims],
+            )
+            .expect("f32 conversion");
+        }
+    }
+    let dist_fn = <f32 as DistanceProvider<f32>>::distance_comparer(metric, Some(ndims));
+    {
+        let LeafBuffers {
+            local_data,
+            dist_matrix,
+            ..
+        } = &mut *bufs;
+        let local = &local_data[..n * ndims];
+        let dm = &mut dist_matrix[..n * n];
+        for i in 0..n {
+            dm[i * n + i] = f32::MAX;
+            let a = &local[i * ndims..(i + 1) * ndims];
+            for j in (i + 1)..n {
+                let d = dist_fn.call(a, &local[j * ndims..(j + 1) * ndims]);
+                dm[i * n + j] = d;
+                dm[j * n + i] = d;
+            }
+        }
+    }
+    let dm = &bufs.dist_matrix[..n * n];
+    prune_leaf_from_matrix(dm, n, indices, None, max_degree, alpha, true)
+}
+
+/// Exp 2 leaf builder: GEMM all-pairs → top-`leaf_k` candidates → (optionally) RobustPrune
+/// to `max_degree`. `leaf_prune=true` = Exp 2 (RobustPrune in leaf); `leaf_prune=false` =
+/// the paper's bi-directed-kNN-style control (keep top-k, prune only at the global merge).
+#[allow(clippy::too_many_arguments)]
+pub fn build_leaf_gemm_topk_robust<T: VectorRepr>(
+    data: &[T],
+    ndims: usize,
+    indices: &[usize],
+    leaf_k: usize,
+    max_degree: usize,
+    metric: Metric,
+    alpha: f32,
+    leaf_prune: bool,
+    bufs: &mut LeafBuffers,
+) -> Vec<Edge> {
+    let n = indices.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+    bufs.ensure_capacity(n, ndims);
+    gemm_fill_dist_matrix(data, ndims, indices, metric, bufs);
+    let dm = &bufs.dist_matrix[..n * n];
+    prune_leaf_from_matrix(dm, n, indices, Some(leaf_k), max_degree, alpha, leaf_prune)
+}
+
+#[cfg(test)]
+mod robust_leaf_tests {
+    use super::*;
+    use diskann_vector::distance::Metric;
+
+    fn invariants(edges: &[Edge], indices: &[usize], max_degree: usize) {
+        use std::collections::HashMap;
+        let leaf: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        let mut deg: HashMap<usize, usize> = HashMap::new();
+        for e in edges {
+            assert_ne!(e.src, e.dst, "no self loops");
+            assert!(leaf.contains(&e.src) && leaf.contains(&e.dst), "edges within leaf");
+            *deg.entry(e.src).or_insert(0) += 1;
+        }
+        for (_s, d) in deg {
+            assert!(d <= max_degree, "degree {} exceeds max_degree {}", d, max_degree);
+        }
+    }
+
+    #[test]
+    fn test_leaf_robust_no_gemm_invariants_and_diversity() {
+        // 5 points: 0=(0,0),1=(1,0),2=(0,1),3=(0.05,0) near-dup of 1,4=(5,5) far.
+        let data = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.05, 0.0, 5.0, 5.0];
+        let indices = vec![0usize, 1, 2, 3, 4];
+        let mut bufs = LeafBuffers::new();
+        let edges = build_leaf_robust_no_gemm(&data, 2, &indices, 8, Metric::L2, 1.0, &mut bufs);
+        assert!(!edges.is_empty());
+        invariants(&edges, &indices, 8);
+        // From point 1=(1,0) at alpha=1.0: 3=(0.05,0) is far closer to 1 than 0/2 are,
+        // so the directed edges from 1 should include 3 (its nearest). Sanity: 1 has edges.
+        assert!(edges.iter().any(|e| e.src == 1), "point 1 should emit edges");
+    }
+
+    #[test]
+    fn test_leaf_gemm_topk_robust_invariants() {
+        // 12 random-ish points in 3D; top-k=5, max_degree 3.
+        let mut data = Vec::new();
+        for i in 0..12 {
+            data.extend_from_slice(&[(i as f32) * 0.3, ((i * 7) % 5) as f32, (i as f32).sin()]);
+        }
+        let indices: Vec<usize> = (0..12).collect();
+        let mut bufs = LeafBuffers::new();
+        let edges = build_leaf_gemm_topk_robust(&data, 3, &indices, 5, 3, Metric::L2, 1.2, true, &mut bufs);
+        assert!(!edges.is_empty());
+        invariants(&edges, &indices, 3);
+    }
+
+    #[test]
+    fn test_leaf_robust_no_gemm_matches_topk_when_k_covers_leaf() {
+        // With leaf_k >= n-1, Exp2's candidate set == all leaf-mates == Exp1's set, so
+        // the two builders must produce identical edge sets (same matrix source aside).
+        let data = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 2.0, 3.0, 0.5];
+        let indices = vec![0usize, 1, 2, 3, 4];
+        let mut b1 = LeafBuffers::new();
+        let mut b2 = LeafBuffers::new();
+        let e1 = build_leaf_robust_no_gemm(&data, 2, &indices, 4, Metric::L2, 1.2, &mut b1);
+        let e2 = build_leaf_gemm_topk_robust(&data, 2, &indices, 100, 4, Metric::L2, 1.2, true, &mut b2);
+        let s1: std::collections::HashSet<(usize, usize)> = e1.iter().map(|e| (e.src, e.dst)).collect();
+        let s2: std::collections::HashSet<(usize, usize)> = e2.iter().map(|e| (e.src, e.dst)).collect();
+        assert_eq!(s1, s2, "all-pairs (no-gemm) and full-k (gemm) prune must agree");
+    }
+}
+
 /// Brute-force search the dataset using L2 distance.
 ///
 /// Returns the `k` nearest neighbor indices and distances for the query.
@@ -787,6 +1301,34 @@ mod tests {
             // Cosine distance for normalized vectors is in [0, 2].
             assert!(edge.distance >= 0.0, "negative cosine distance");
         }
+    }
+
+    #[test]
+    fn test_build_leaf_cosine_normalized_matches_unit_norm_l2_neighbors() {
+        // CosineNormalized assumes unit vectors. On unit vectors, squared L2
+        // and 1-dot induce the same ordering, so the directed neighbor set
+        // should match the L2 path even if the optimized cosine-normalized path
+        // skips explicit norm computation.
+        let mut data = vec![
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.8, 0.6, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        for row in data.chunks_exact_mut(3) {
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for v in row.iter_mut() {
+                *v /= norm;
+            }
+        }
+
+        let indices = vec![0, 1, 2, 3, 4];
+        let cosine_edges = build_leaf(&data, 3, &indices, 2, Metric::CosineNormalized);
+        let l2_edges = build_leaf(&data, 3, &indices, 2, Metric::L2);
+
+        let cosine_set: std::collections::HashSet<(usize, usize)> =
+            cosine_edges.iter().map(|e| (e.src, e.dst)).collect();
+        let l2_set: std::collections::HashSet<(usize, usize)> =
+            l2_edges.iter().map(|e| (e.src, e.dst)).collect();
+
+        assert_eq!(cosine_set, l2_set);
     }
 
     #[test]

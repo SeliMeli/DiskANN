@@ -14,6 +14,8 @@
 //! 4. Optional: final diversity prune on each node
 //! 5. return G
 
+use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use diskann::utils::VectorRepr;
@@ -26,6 +28,18 @@ use crate::{PiPNNConfig, PiPNNError, PiPNNResult};
 
 use diskann_vector::distance::{Distance, DistanceProvider, Metric};
 
+/// Env switch: `PIPNN_LEAF_SORT=1` enables the leaf-order sort. Off by
+/// default because the May 2026 experiment showed that sorting by min point
+/// ID barely raises cache hit rate (3.5% vs 2.4% without sort on Enron 1M).
+fn leaf_sort_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("PIPNN_LEAF_SORT").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("on")
+        )
+    })
+}
 
 /// Create a DiskANN distance functor for the given metric.
 ///
@@ -261,32 +275,44 @@ impl PiPNNGraph {
     }
 }
 
-/// Find the medoid: the point closest to the centroid.
+/// Find the approximate medoid via sampling.
 ///
-/// Uses squared L2 distance to find the nearest point to the centroid,
-/// matching DiskANN's `find_medoid_with_sampling` behavior. The centroid
-/// is a geometric center, so L2 is the natural metric regardless of the
-/// build distance metric.
+/// Samples a subset of points to estimate the centroid, then finds the
+/// nearest sampled point. For 10M+ datasets this is ~100x faster than
+/// the exact scan with near-identical results.
 fn find_medoid<T: VectorRepr>(data: &[T], npoints: usize, ndims: usize) -> usize {
+    use rand::prelude::IndexedRandom;
+    use rand::SeedableRng;
+
     let dist_fn = make_dist_fn(Metric::L2);
 
-    // Compute centroid.
+    // Sample up to 100k points for centroid estimation.
+    let sample_size = npoints.min(100_000);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let all_indices: Vec<usize> = (0..npoints).collect();
+    let samples: Vec<usize> = all_indices
+        .choose_multiple(&mut rng, sample_size)
+        .copied()
+        .collect();
+
+    // Compute centroid from samples.
     let mut centroid = vec![0.0f32; ndims];
     let mut point_buf = vec![0.0f32; ndims];
-    for i in 0..npoints {
+    for &i in &samples {
         T::as_f32_into(&data[i * ndims..(i + 1) * ndims], &mut point_buf).expect("f32 conversion");
         for d in 0..ndims {
             centroid[d] += point_buf[d];
         }
     }
-    let inv_n = 1.0 / npoints as f32;
+    let inv_n = 1.0 / sample_size as f32;
     for c in &mut centroid {
         *c *= inv_n;
     }
 
-    let mut best_idx = 0;
+    // Find nearest sampled point to centroid.
+    let mut best_idx = samples[0];
     let mut best_dist = f32::MAX;
-    for i in 0..npoints {
+    for &i in &samples {
         T::as_f32_into(&data[i * ndims..(i + 1) * ndims], &mut point_buf).expect("f32 conversion");
         let dist = dist_fn.call(&point_buf, &centroid);
         if dist < best_dist {
@@ -568,15 +594,19 @@ fn build_internal_sq_impl(
             p_samp: config.p_samp,
             fanout: config.fanout.clone(),
             metric: config.metric,
+            leader_cap: config.leader_cap,
         };
-        let leaves = crate::partition_v2::partition_quantized(
-            &qdata,
-            npoints,
-            &partition_config,
-            seed,
-        );
+        let leaves =
+            crate::partition::partition_quantized(&qdata, npoints, &partition_config, seed);
         total_leaves += leaves.len();
         partition_secs += t1.elapsed().as_secs_f64();
+
+        // Release partition stripe buffers before leaf build.
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| {
+                crate::partition::release_stripe_buffers();
+            });
 
         let t2 = Instant::now();
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -659,8 +689,37 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
 ) -> PiPNNResult<PiPNNGraph> {
     let t_total = Instant::now();
 
+    // Report which SIMD tier was compiled in.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    eprintln!("SIMD: AVX-512 (compile-time)");
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_feature = "avx512f"),
+        target_feature = "avx2"
+    ))]
+    eprintln!("SIMD: AVX2 (compile-time)");
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_feature = "avx512f"),
+        not(target_feature = "avx2")
+    ))]
+    eprintln!("SIMD: scalar (compile-time)");
+    #[cfg(not(target_arch = "x86_64"))]
+    eprintln!("SIMD: scalar (non-x86)");
+
     // Compute medoid once upfront.
     let medoid = find_medoid(data, npoints, ndims);
+
+    // Experimental RobustPrune merge modes (Exp 1 / Exp 2): replace HashPrune with a
+    // per-leaf RobustPrune + candidate accumulation + final RobustPrune. f32 path only.
+    if config.leaf_prune_mode != crate::LeafPruneMode::Baseline
+        && config.merge_mode == crate::MergeMode::Accumulate
+        && qdata.is_none()
+    {
+        return build_internal_robust(data, npoints, ndims, config, medoid);
+    }
+    // Otherwise: HashPrune merge (Baseline k-NN, or — when merge_mode=HashPrune — leaf
+    // RobustPrune candidates streamed into the bounded reservoir; the paper's design).
 
     // Initialize HashPrune for edge merging.
     let t0 = Instant::now();
@@ -692,41 +751,34 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
             p_samp: config.p_samp,
             fanout: config.fanout.clone(),
             metric: config.metric,
+            leader_cap: config.leader_cap,
         };
 
-        let leaves = if let Some(ref q) = qdata {
-            crate::partition_v2::partition_quantized(q, npoints, &partition_config, seed)
+        let mut leaves = if let Some(ref q) = qdata {
+            crate::partition::partition_quantized(q, npoints, &partition_config, seed)
         } else {
-            crate::partition_v2::partition(data, ndims, npoints, &partition_config, seed)
+            crate::partition::partition(data, ndims, npoints, &partition_config, seed)
         };
         partition_secs += t1.elapsed().as_secs_f64();
-
-        let total_pts: usize = leaves.iter().map(|l| l.indices.len()).sum();
-        let leaf_sizes: Vec<usize> = leaves.iter().map(|l| l.indices.len()).collect();
         total_leaves += leaves.len();
-        let small_leaves = leaf_sizes.iter().filter(|&&s| s < 64).count();
-        let med_leaves = leaf_sizes
-            .iter()
-            .filter(|&&s| (64..512).contains(&s))
-            .count();
-        let big_leaves = leaf_sizes.iter().filter(|&&s| s >= 512).count();
-        tracing::info!(
-            replica = replica,
-            partition_secs = t1.elapsed().as_secs_f64(),
-            num_leaves = leaves.len(),
-            avg_leaf_size = total_pts as f64 / leaves.len().max(1) as f64,
-            max_leaf_size = leaf_sizes.iter().max().unwrap_or(&0),
-            total_pts = total_pts,
-            "Partition complete"
-        );
-        // Hint to return freed partition GEMM buffers to the OS.
-        tracing::debug!(
-            small_leaves = small_leaves,
-            med_leaves = med_leaves,
-            big_leaves = big_leaves,
-            overlap = total_pts as f64 / npoints as f64,
-            "Leaf size distribution"
-        );
+
+        // Sort leaves so the point-cache (in LeafBuffers) gets repeated hits:
+        // each point appears in ~fanout-product leaves; if those leaves are
+        // adjacent in the work list, consecutive batches on the same thread
+        // hit the warm cache instead of cold DRAM. Sorting by the leaf's
+        // smallest point ID groups leaves drawn from the same partition
+        // subtree (point IDs in a subtree cluster numerically by birth order).
+        // PIPNN_LEAF_SORT=0 disables for A/B testing.
+        if leaf_sort_enabled() {
+            leaves.sort_unstable_by_key(|l| l.indices.iter().copied().min().unwrap_or(0));
+        }
+
+        // Release partition stripe buffers (~1 GB) before leaf build starts.
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| {
+                crate::partition::release_stripe_buffers();
+            });
 
         // Build leaves in parallel, streaming edges to HashPrune per-leaf.
         let t2 = Instant::now();
@@ -744,17 +796,59 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
                 for leaf in chunk {
                     let indices_usize: Vec<usize> =
                         leaf.indices.iter().map(|&i| i as usize).collect();
+                    // Per-leaf candidate generation. Baseline = bi-directed k-NN. The
+                    // RobustPrune leaf modes (when merge_mode=HashPrune) feed their pruned
+                    // candidates into the same bounded HashPrune reservoir — the paper's
+                    // RobustPrune-as-candidate-feeder ablation.
+                    let leaf_deg = if config.leaf_prune_degree > 0 {
+                        config.leaf_prune_degree
+                    } else {
+                        config.max_degree
+                    };
                     let edges = if let Some(ref q) = qdata {
                         leaf_build::build_leaf_quantized(q, &indices_usize, config.k)
                     } else {
-                        leaf_build::build_leaf_with_buffers(
-                            data,
-                            ndims,
-                            &indices_usize,
-                            config.k,
-                            config.metric,
-                            &mut bufs,
-                        )
+                        match config.leaf_prune_mode {
+                            crate::LeafPruneMode::Baseline | crate::LeafPruneMode::KnnBidir => {
+                                leaf_build::build_leaf_with_buffers(
+                                    data,
+                                    ndims,
+                                    &indices_usize,
+                                    config.k,
+                                    config.metric,
+                                    &mut bufs,
+                                )
+                            }
+                            crate::LeafPruneMode::RobustNoGemm => {
+                                leaf_build::build_leaf_robust_no_gemm(
+                                    data,
+                                    ndims,
+                                    &indices_usize,
+                                    leaf_deg,
+                                    config.metric,
+                                    config.alpha,
+                                    &mut bufs,
+                                )
+                            }
+                            crate::LeafPruneMode::GemmTopKRobust
+                            | crate::LeafPruneMode::GemmTopKNoPrune => {
+                                let leaf_prune = matches!(
+                                    config.leaf_prune_mode,
+                                    crate::LeafPruneMode::GemmTopKRobust
+                                );
+                                leaf_build::build_leaf_gemm_topk_robust(
+                                    data,
+                                    ndims,
+                                    &indices_usize,
+                                    config.k,
+                                    leaf_deg,
+                                    config.metric,
+                                    config.alpha,
+                                    leaf_prune,
+                                    &mut bufs,
+                                )
+                            }
+                        }
                     };
                     total_edges.fetch_add(edges.len(), Ordering::Relaxed);
                     hash_prune.add_edges_batched(&edges);
@@ -775,11 +869,24 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
     }
 
     // Release thread-local leaf buffers so their arena pages can be reclaimed.
+    // The release path also folds each thread's hit/miss counters into the
+    // global PIPNN point-cache counters, so we read them right after.
     (0..rayon::current_num_threads())
         .into_par_iter()
         .for_each(|_| {
             leaf_build::release_thread_buffers();
         });
+    let pc_hits = leaf_build::POINT_CACHE_HITS.swap(0, Ordering::Relaxed);
+    let pc_misses = leaf_build::POINT_CACHE_MISSES.swap(0, Ordering::Relaxed);
+    if pc_hits + pc_misses > 0 {
+        let total = (pc_hits + pc_misses) as f64;
+        eprintln!(
+            "PointCache: hits={} misses={} hit_rate={:.1}%",
+            pc_hits,
+            pc_misses,
+            100.0 * pc_hits as f64 / total
+        );
+    }
 
     // Extract graph and optionally apply diversity-aware final prune.
     let t3 = Instant::now();
@@ -787,57 +894,18 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
         // Extract full reservoir (l_max candidates with distances) for diversity prune.
         let candidates = hash_prune.extract_graph_for_prune();
         let extract_secs = t3.elapsed().as_secs_f64();
-        tracing::info!(
-            elapsed_secs = extract_secs,
-            "Graph extraction complete (full reservoir)"
-        );
 
         let t4 = Instant::now();
-        tracing::info!(
-            "Applying final prune (selecting {} from {} candidates)",
+        // Use the iterative-alpha occlude_list port so the HashPrune-extract path and the
+        // accumulate path share one final-prune impl (keeps comparisons apples-to-apples).
+        let adj = crate::prune::final_robust_prune(
+            data,
+            ndims,
+            &candidates,
             config.max_degree,
-            config.l_max
-        );
-        // Log candidate stats before pruning.
-        let total_candidates: usize = candidates.iter().map(|c| c.len()).sum();
-        let nodes_over_degree = candidates.iter().filter(|c| c.len() > config.max_degree).count();
-        let max_cand = candidates.iter().map(|c| c.len()).max().unwrap_or(0);
-        let avg_cand = if candidates.is_empty() { 0.0 } else { total_candidates as f64 / candidates.len() as f64 };
-        println!(
-            "  Final prune input: {} nodes, avg {:.1} candidates, max {}, {} nodes over max_degree({})",
-            candidates.len(), avg_cand, max_cand, nodes_over_degree, config.max_degree
-        );
-
-        let use_diskann_prune = std::env::var("PIPNN_DISKANN_PRUNE").is_ok();
-        let adj = if use_diskann_prune {
-            tracing::info!("Using DiskANN-style iterative occlude_list prune");
-            final_prune_diskann_style(
-                data,
-                ndims,
-                &candidates,
-                config.max_degree,
-                config.metric,
-                config.alpha,
-            )
-        } else {
-            tracing::info!("Using paper-style single-pass prune");
-            final_prune_from_candidates(
-                data,
-                ndims,
-                &candidates,
-                config.max_degree,
-                config.metric,
-                config.alpha,
-            )
-        };
-
-        // Log output stats after pruning.
-        let total_edges: usize = adj.iter().map(|a| a.len()).sum();
-        let avg_degree = if adj.is_empty() { 0.0 } else { total_edges as f64 / adj.len() as f64 };
-        let pruned_count = candidates.iter().zip(adj.iter()).filter(|(c, a)| a.len() < c.len()).count();
-        println!(
-            "  Final prune output: avg degree {:.1}, {} nodes actually pruned ({:.1}%)",
-            avg_degree, pruned_count, 100.0 * pruned_count as f64 / candidates.len().max(1) as f64
+            config.metric,
+            config.alpha,
+            config.saturate_after_prune,
         );
 
         let final_prune_secs = t4.elapsed().as_secs_f64();
@@ -846,7 +914,6 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
         // No prune: truncate to max_degree by distance (original path).
         let adj = hash_prune.extract_graph();
         let extract_secs = t3.elapsed().as_secs_f64();
-        tracing::info!(elapsed_secs = extract_secs, "Graph extraction complete");
         (adj, extract_secs, 0.0)
     };
 
@@ -875,6 +942,12 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
     // Return all freed memory (reservoirs, sketches, partition buffers, leaf buffers)
     // to the OS before handing off to the disk layout phase.
 
+    eprintln!(
+        "PiPNN graph: avg_degree={:.3} max_degree={} isolated={} (HashPrune baseline)",
+        graph.avg_degree(),
+        graph.max_degree(),
+        graph.num_isolated(),
+    );
     tracing::info!(
         avg_degree = graph.avg_degree(),
         max_degree = graph.max_degree(),
@@ -882,6 +955,214 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
         "PiPNN build complete"
     );
 
+    Ok(graph)
+}
+
+/// Unifies the two candidate accumulators behind one call so the leaf loop is generic.
+trait EdgeSink: Sync {
+    fn sink_edges(&self, edges: &[leaf_build::Edge]);
+}
+impl EdgeSink for crate::candidate_pool::CandidatePool {
+    fn sink_edges(&self, edges: &[leaf_build::Edge]) {
+        self.add_edges_batched(edges);
+    }
+}
+impl EdgeSink for crate::candidate_pool::AppendOnlyPool {
+    fn sink_edges(&self, edges: &[leaf_build::Edge]) {
+        self.add_edges_batched(edges);
+    }
+}
+
+/// Partition + per-leaf RobustPrune for the experimental merge modes, streaming pruned
+/// edges into `sink`. Mirrors the baseline replica/partition/par_chunks structure.
+// Runs inside the rayon pool installed by `build_internal`.
+#[allow(clippy::disallowed_methods)]
+fn run_leaves_robust<T: VectorRepr + Send + Sync, S: EdgeSink>(
+    data: &[T],
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    sink: &S,
+) -> (f64, usize, usize) {
+    let mut partition_secs = 0.0f64;
+    let mut total_leaves = 0usize;
+    let raw_edges = std::sync::atomic::AtomicUsize::new(0);
+    for replica in 0..config.replicas {
+        let seed = 1000 + replica as u64 * 7919;
+        let partition_config = PartitionConfig {
+            c_max: config.c_max,
+            c_min: config.c_min,
+            p_samp: config.p_samp,
+            fanout: config.fanout.clone(),
+            metric: config.metric,
+            leader_cap: config.leader_cap,
+        };
+        let t_part = Instant::now();
+        let leaves = crate::partition::partition(data, ndims, npoints, &partition_config, seed);
+        partition_secs += t_part.elapsed().as_secs_f64();
+        total_leaves += leaves.len();
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| crate::partition::release_stripe_buffers());
+
+        const LEAF_BATCH: usize = 64;
+        leaves.par_chunks(LEAF_BATCH).for_each(|chunk| {
+            leaf_build::LEAF_BUFFERS.with(|cell| {
+                let mut bufs = cell.borrow_mut();
+                for leaf in chunk {
+                    let indices_usize: Vec<usize> =
+                        leaf.indices.iter().map(|&i| i as usize).collect();
+                    let leaf_deg = if config.leaf_prune_degree > 0 {
+                        config.leaf_prune_degree
+                    } else {
+                        config.max_degree
+                    };
+                    let edges = match config.leaf_prune_mode {
+                        crate::LeafPruneMode::RobustNoGemm => leaf_build::build_leaf_robust_no_gemm(
+                            data,
+                            ndims,
+                            &indices_usize,
+                            leaf_deg,
+                            config.metric,
+                            config.alpha,
+                            &mut bufs,
+                        ),
+                        // GemmTopKRobust = prune in leaf; GemmTopKNoPrune = keep top-k
+                        // (the paper's bi-directed-kNN-style control: no leaf prune).
+                        crate::LeafPruneMode::GemmTopKRobust
+                        | crate::LeafPruneMode::GemmTopKNoPrune => {
+                            let leaf_prune = matches!(
+                                config.leaf_prune_mode,
+                                crate::LeafPruneMode::GemmTopKRobust
+                            );
+                            leaf_build::build_leaf_gemm_topk_robust(
+                                data,
+                                ndims,
+                                &indices_usize,
+                                config.k,
+                                leaf_deg,
+                                config.metric,
+                                config.alpha,
+                                leaf_prune,
+                                &mut bufs,
+                            )
+                        }
+                        // Bi-directed k-NN candidates feeding the accumulator (clean
+                        // iso-leaf merge comparison vs HashPrune).
+                        crate::LeafPruneMode::KnnBidir => leaf_build::build_leaf_with_buffers(
+                            data,
+                            ndims,
+                            &indices_usize,
+                            config.k,
+                            config.metric,
+                            &mut bufs,
+                        ),
+                        crate::LeafPruneMode::Baseline => Vec::new(),
+                    };
+                    raw_edges.fetch_add(edges.len(), std::sync::atomic::Ordering::Relaxed);
+                    sink.sink_edges(&edges);
+                }
+            });
+        });
+    }
+    (0..rayon::current_num_threads())
+        .into_par_iter()
+        .for_each(|_| leaf_build::release_thread_buffers());
+    (partition_secs, total_leaves, raw_edges.into_inner())
+}
+
+/// RobustPrune merge build (Exp 1 / Exp 2): accumulate per-leaf RobustPruned edges, then
+/// run one final RobustPrune. No HashPrune. f32/typed path only (final prune needs f32).
+fn build_internal_robust<T: VectorRepr + Send + Sync>(
+    data: &[T],
+    npoints: usize,
+    ndims: usize,
+    config: &PiPNNConfig,
+    medoid: usize,
+) -> PiPNNResult<PiPNNGraph> {
+    let t_total = Instant::now();
+    eprintln!(
+        "PiPNN RobustPrune merge: mode={:?} merge_l_max={} leaf_k={} alpha={}",
+        config.leaf_prune_mode, config.merge_l_max, config.k, config.alpha
+    );
+
+    let t_leaf = Instant::now();
+    let (candidates, partition_secs, total_leaves, raw_edges): (
+        Vec<Vec<(u32, f32)>>,
+        f64,
+        usize,
+        usize,
+    ) = if config.merge_l_max > 0 {
+        let pool = crate::candidate_pool::CandidatePool::new(npoints, config.merge_l_max);
+        let (ps, nl, raw) = run_leaves_robust(data, npoints, ndims, config, &pool);
+        (pool.extract_dedupped_sorted(), ps, nl, raw)
+    } else {
+        let pool = crate::candidate_pool::AppendOnlyPool::new(npoints);
+        let (ps, nl, raw) = run_leaves_robust(data, npoints, ndims, config, &pool);
+        (pool.extract_dedupped_sorted(), ps, nl, raw)
+    };
+    // leaf_build_secs excludes the partition time tracked separately.
+    let leaf_build_secs = (t_leaf.elapsed().as_secs_f64() - partition_secs).max(0.0);
+    let accumulated_edges: usize = candidates.iter().map(|c| c.len()).sum();
+    let max_fanin = candidates.iter().map(|c| c.len()).max().unwrap_or(0);
+    eprintln!(
+        "  PRUNE FAN-IN: raw_accumulated={} dedupped={} avg_per_node={:.1} max_per_node={} -> final RobustPrune to max_degree={}",
+        raw_edges,
+        accumulated_edges,
+        accumulated_edges as f64 / npoints as f64,
+        max_fanin,
+        config.max_degree
+    );
+
+    let t_fp = Instant::now();
+    let adjacency = crate::prune::final_robust_prune(
+        data,
+        ndims,
+        &candidates,
+        config.max_degree,
+        config.metric,
+        config.alpha,
+        config.saturate_after_prune,
+    );
+    drop(candidates);
+    let final_prune_secs = t_fp.elapsed().as_secs_f64();
+
+    let total_secs = t_total.elapsed().as_secs_f64();
+    let build_stats = PiPNNBuildStats {
+        total_secs,
+        sketch_secs: 0.0,
+        partition_secs,
+        leaf_build_secs,
+        extract_secs: 0.0,
+        final_prune_secs,
+        num_leaves: total_leaves,
+        total_edges: accumulated_edges,
+    };
+    print!("{}", build_stats);
+
+    let graph = PiPNNGraph {
+        adjacency,
+        npoints,
+        ndims,
+        medoid,
+        metric: config.metric,
+        build_stats,
+    };
+    eprintln!(
+        "PiPNN graph: avg_degree={:.3} max_degree={} isolated={} (mode={:?}, {} leaves, {} accumulated cand)",
+        graph.avg_degree(),
+        graph.max_degree(),
+        graph.num_isolated(),
+        config.leaf_prune_mode,
+        total_leaves,
+        accumulated_edges,
+    );
+    tracing::info!(
+        avg_degree = graph.avg_degree(),
+        max_degree = graph.max_degree(),
+        isolated = graph.num_isolated(),
+        "PiPNN RobustPrune-merge build complete"
+    );
     Ok(graph)
 }
 
@@ -894,235 +1175,128 @@ fn build_internal_impl<T: VectorRepr + Send + Sync>(
 // Called from within `build_internal_impl` which already runs inside a dedicated rayon
 // thread pool installed by `build_internal`, so `par_iter` work executes on that pool.
 #[allow(clippy::disallowed_methods)]
-fn final_prune_from_candidates<T: VectorRepr + Send + Sync>(
+pub fn final_prune_from_candidates<T: VectorRepr + Send + Sync>(
     data: &[T],
     ndims: usize,
     candidates_per_node: &[Vec<(u32, f32)>],
     max_degree: usize,
     metric: Metric,
     alpha: f32,
+    saturate: bool,
 ) -> Vec<Vec<u32>> {
-    // Dimension-specialized distance kernel — enables SIMD target features AND
-    // compile-time loop unrolling for the known dimension. dispatch2 (not no_features)
-    // applies #[target_feature] for AVX2/AVX-512 based on runtime CPU detection.
+    // Dimension-specialized f32 distance — fastest for the many-to-many occlusion loop.
+    // f32 precompute converts each candidate once; the occlusion loop then uses pure f32 FMA
+    // (~55 reuses per candidate). Native f16 would do F16C conversion on every reuse.
     let dist_fn = <f32 as DistanceProvider<f32>>::distance_comparer(metric, Some(ndims));
+
+    // Thread-local f32 buffer to avoid per-node allocation.
+    thread_local! {
+        static PRUNE_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     candidates_per_node
         .par_iter()
-        .map(|candidates| {
+        .enumerate()
+        .map(|(node_id, candidates)| {
             if candidates.is_empty() {
                 return Vec::new();
             }
 
             let nc = candidates.len();
 
-            // Skip prune if already at or below max_degree.
-            if nc <= max_degree {
-                return candidates.iter().map(|&(id, _)| id).collect();
-            }
+            PRUNE_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                // node_f32 (ndims) + cand_f32 (nc * ndims)
+                let total = (nc + 1) * ndims;
+                if buf.len() < total {
+                    buf.resize(total, 0.0);
+                }
 
-            // Precompute f32 data for all candidates once, instead of converting
-            // per-comparison. With l_max=128 and max_degree=64, the inner loop
-            // does O(l_max × max_degree) comparisons — converting per-comparison
-            // was O(l_max² × ndims) f16→f32 conversions (42s at 10M scale).
-            let mut cand_f32 = vec![0.0f32; nc * ndims];
-            for (ci, &(id, _)) in candidates.iter().enumerate() {
-                let src = &data[id as usize * ndims..(id as usize + 1) * ndims];
-                T::as_f32_into(src, &mut cand_f32[ci * ndims..(ci + 1) * ndims])
+                // Convert node + all candidates to f32 once.
+                let (node_f32, cand_f32) = buf[..total].split_at_mut(ndims);
+                T::as_f32_into(&data[node_id * ndims..(node_id + 1) * ndims], node_f32)
                     .expect("f32 conversion");
-            }
 
-            // Paper's Algorithm 2: greedy selection with occlusion removal.
-            // Track selected vs occluded separately for saturation.
-            const UNVISITED: u8 = 0;
-            const SELECTED: u8 = 1;
-            const OCCLUDED: u8 = 2;
-            let mut state = vec![UNVISITED; nc];
-            let mut selected: Vec<u32> = Vec::with_capacity(max_degree);
-
-            for i in 0..nc {
-                if selected.len() >= max_degree {
-                    break;
-                }
-                if state[i] != UNVISITED {
-                    continue;
-                }
-
-                selected.push(candidates[i].0);
-                state[i] = SELECTED;
-
-                let y_f32 = &cand_f32[i * ndims..(i + 1) * ndims];
-
-                for j in (i + 1)..nc {
-                    if state[j] != UNVISITED {
-                        continue;
-                    }
-                    let dist_x_z = candidates[j].1;
-                    let z_f32 = &cand_f32[j * ndims..(j + 1) * ndims];
-                    let dist_y_z = dist_fn.call(y_f32, z_f32);
-
-                    if alpha * dist_y_z < dist_x_z {
-                        state[j] = OCCLUDED;
+                let mut fresh_dist_xz = vec![0.0f32; nc];
+                {
+                    let _timer =
+                        crate::profile::PhaseTimer::start("final_prune/convert_and_dist_xz");
+                    for (ci, &(id, _)) in candidates.iter().enumerate() {
+                        let dst = &mut cand_f32[ci * ndims..(ci + 1) * ndims];
+                        T::as_f32_into(&data[id as usize * ndims..(id as usize + 1) * ndims], dst)
+                            .expect("f32 conversion");
+                        fresh_dist_xz[ci] = dist_fn.call(node_f32, dst);
                     }
                 }
-            }
 
-            // Saturation: fill remaining degree slots with any non-selected candidate,
-            // closest-first (candidates are distance-sorted). Matches DiskANN's behavior:
-            // iterate pool in distance order, add any candidate not already selected.
-            if selected.len() < max_degree {
-                for i in 0..nc {
-                    if selected.len() >= max_degree {
-                        break;
-                    }
-                    if state[i] != SELECTED {
-                        selected.push(candidates[i].0);
-                    }
+                // Sort by fresh distance.
+                let mut order: Vec<usize> = (0..nc).collect();
+                {
+                    let _timer = crate::profile::PhaseTimer::start("final_prune/sort");
+                    order.sort_unstable_by(|&a, &b| {
+                        fresh_dist_xz[a]
+                            .partial_cmp(&fresh_dist_xz[b])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
                 }
-            }
 
-            selected
-        })
-        .collect()
-}
+                // Greedy occlusion — prune ALL nodes for diversity.
+                const UNVISITED: u8 = 0;
+                const SELECTED: u8 = 1;
+                const OCCLUDED: u8 = 2;
+                let mut state = vec![UNVISITED; nc];
+                let mut selected: Vec<u32> = Vec::with_capacity(max_degree.min(nc));
 
-/// DiskANN-style iterative occlude_list prune.
-///
-/// Key differences from our paper-based `final_prune_from_candidates`:
-/// 1. Iterative alpha: starts at 1.0, multiplies by min(alpha, 1.2) each round
-/// 2. Accumulated occlusion factor: tracks max(dist_x_z / dist_y_z) per candidate
-/// 3. Resumable inner loop: last_checked avoids redundant comparisons across rounds
-///
-/// This produces more navigable graphs because early rounds (alpha=1.0) select
-/// only maximally diverse edges, and later rounds relax to fill remaining slots.
-#[allow(clippy::disallowed_methods)]
-fn final_prune_diskann_style<T: VectorRepr + Send + Sync>(
-    data: &[T],
-    ndims: usize,
-    candidates_per_node: &[Vec<(u32, f32)>],
-    max_degree: usize,
-    metric: Metric,
-    alpha: f32,
-) -> Vec<Vec<u32>> {
-    let dist_fn = <f32 as DistanceProvider<f32>>::distance_comparer(metric, Some(ndims));
-    let increment_factor = alpha.min(1.2);
-
-    candidates_per_node
-        .par_iter()
-        .map(|candidates| {
-            if candidates.is_empty() {
-                return Vec::new();
-            }
-
-            let nc = candidates.len();
-
-            if nc <= max_degree {
-                return candidates.iter().map(|&(id, _)| id).collect();
-            }
-
-            // Precompute f32 data for all candidates once.
-            let mut cand_f32 = vec![0.0f32; nc * ndims];
-            for (ci, &(id, _)) in candidates.iter().enumerate() {
-                let src = &data[id as usize * ndims..(id as usize + 1) * ndims];
-                T::as_f32_into(src, &mut cand_f32[ci * ndims..(ci + 1) * ndims])
-                    .expect("f32 conversion");
-            }
-
-            // Per-candidate state (matching DiskANN's occlude_list):
-            // - occlude_factor: accumulated max occlusion ratio across all selected nodes
-            // - last_checked: index into `selected` up to which we've compared this candidate
-            let mut occlude_factor = vec![0.0f32; nc];
-            let mut last_checked = vec![0u16; nc];
-            // selected stores indices into candidates[] (not point IDs) for cache locality
-            let mut selected_idx: Vec<usize> = Vec::with_capacity(max_degree);
-
-            let mut current_alpha = 1.0f32;
-
-            loop {
-                for i in 0..nc {
-                    if selected_idx.len() >= max_degree {
-                        break;
-                    }
-
-                    // Already occluded beyond current threshold
-                    if occlude_factor[i] > current_alpha {
-                        continue;
-                    }
-
-                    // Already selected
-                    if occlude_factor[i] == f32::MAX {
-                        continue;
-                    }
-
-                    // Resume comparison from where we left off in previous alpha round
-                    let mut skip = false;
-                    let pos = &mut last_checked[i];
-                    while (*pos as usize) < selected_idx.len() {
-                        let sel_idx = selected_idx[*pos as usize];
-                        *pos += 1;
-
-                        // sel_idx should be before i in candidate order (closer to point)
-                        if sel_idx >= i {
+                {
+                    let _timer = crate::profile::PhaseTimer::start("final_prune/occlusion_loop");
+                    for oi in 0..nc {
+                        let i = order[oi];
+                        if selected.len() >= max_degree {
+                            break;
+                        }
+                        if state[i] != UNVISITED {
                             continue;
                         }
 
-                        let dist_x_z = candidates[i].1; // dist(point, candidate_i)
-                        let y_f32 = &cand_f32[sel_idx * ndims..(sel_idx + 1) * ndims];
-                        let z_f32 = &cand_f32[i * ndims..(i + 1) * ndims];
-                        let dist_y_z = dist_fn.call(y_f32, z_f32);
+                        selected.push(candidates[i].0);
+                        state[i] = SELECTED;
 
-                        // Occlusion factor = max ratio of (selected_dist / candidate_dist)
-                        // Higher factor = more occluded by existing selections
-                        if dist_x_z > 0.0 {
-                            let ratio = dist_y_z / dist_x_z;
-                            if ratio > occlude_factor[i] {
-                                occlude_factor[i] = ratio;
+                        let y_f32 = &cand_f32[i * ndims..(i + 1) * ndims];
+
+                        for oj in (oi + 1)..nc {
+                            let j = order[oj];
+                            if state[j] != UNVISITED {
+                                continue;
+                            }
+                            let dist_x_z = fresh_dist_xz[j];
+                            let z_f32 = &cand_f32[j * ndims..(j + 1) * ndims];
+                            let dist_y_z = dist_fn.call(y_f32, z_f32);
+
+                            if alpha * dist_y_z < dist_x_z {
+                                state[j] = OCCLUDED;
                             }
                         }
+                    }
+                }
 
-                        if occlude_factor[i] > current_alpha {
-                            skip = true;
-                            break;
+                // Saturation: fill remaining degree slots in fresh distance order.
+                {
+                    let _timer = crate::profile::PhaseTimer::start("final_prune/saturate");
+                    if saturate && selected.len() < max_degree {
+                        for oi in 0..nc {
+                            let i = order[oi];
+                            if selected.len() >= max_degree {
+                                break;
+                            }
+                            if state[i] != SELECTED {
+                                selected.push(candidates[i].0);
+                            }
                         }
                     }
-
-                    if skip || occlude_factor[i] > current_alpha {
-                        continue;
-                    }
-
-                    // Select this candidate
-                    occlude_factor[i] = f32::MAX; // mark as selected
-                    selected_idx.push(i);
                 }
 
-                if current_alpha >= alpha || selected_idx.len() >= max_degree {
-                    break;
-                }
-                current_alpha = (current_alpha * increment_factor).min(alpha);
-            }
-
-            // Saturation: if selected < max_degree after all alpha rounds,
-            // fill remaining slots with closest un-selected candidates by distance.
-            // Matches DiskANN's saturate_after_prune behavior (always on when alpha > 1.0).
-            if alpha > 1.0 && selected_idx.len() < max_degree {
-                for i in 0..nc {
-                    if selected_idx.len() >= max_degree {
-                        break;
-                    }
-                    // Skip already-selected (marked with f32::MAX)
-                    if occlude_factor[i] == f32::MAX {
-                        continue;
-                    }
-                    // Candidates are sorted by distance, so first un-selected is closest
-                    selected_idx.push(i);
-                }
-            }
-
-            // Convert selected indices to point IDs
-            selected_idx
-                .iter()
-                .map(|&i| candidates[i].0)
-                .collect()
+                selected
+            }) // close PRUNE_BUF.with
         })
         .collect()
 }
@@ -1959,9 +2133,12 @@ mod tests {
             total_parsed_nodes += 1;
         }
         assert_eq!(
-            total_parsed_nodes, npoints + 1, // +1 for frozen start point
+            total_parsed_nodes,
+            npoints + 1, // +1 for frozen start point
             "expected to parse {} nodes ({}+1 frozen) but got {}",
-            npoints + 1, npoints, total_parsed_nodes
+            npoints + 1,
+            npoints,
+            total_parsed_nodes
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2102,7 +2279,7 @@ mod tests {
             vec![],
         ];
 
-        let result = final_prune_from_candidates(&data, 2, &candidates, 2, Metric::L2, 1.2);
+        let result = final_prune_from_candidates(&data, 2, &candidates, 2, Metric::L2, 1.2, true);
         let node0 = &result[0];
         // With alpha=1.2, point 3 should be selected first (closest).
         // Point 1 might be pruned because dist(3,1) * 1.2 < dist(0,1).
@@ -2120,7 +2297,7 @@ mod tests {
     fn test_final_prune_from_candidates_empty() {
         let data: Vec<f32> = vec![0.0; 8];
         let candidates: Vec<Vec<(u32, f32)>> = vec![vec![], vec![], vec![], vec![]];
-        let result = final_prune_from_candidates(&data, 2, &candidates, 10, Metric::L2, 1.2);
+        let result = final_prune_from_candidates(&data, 2, &candidates, 10, Metric::L2, 1.2, true);
         assert!(result.iter().all(|adj| adj.is_empty()));
     }
 
@@ -2128,7 +2305,7 @@ mod tests {
     fn test_final_prune_from_candidates_single_candidate() {
         let data: Vec<f32> = vec![0.0, 0.0, 1.0, 0.0];
         let candidates = vec![vec![(1, 1.0f32)], vec![(0, 1.0f32)]];
-        let result = final_prune_from_candidates(&data, 2, &candidates, 10, Metric::L2, 1.2);
+        let result = final_prune_from_candidates(&data, 2, &candidates, 10, Metric::L2, 1.2, true);
         assert_eq!(result[0], vec![1]);
         assert_eq!(result[1], vec![0]);
     }

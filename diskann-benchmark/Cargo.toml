@@ -39,6 +39,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 scopeguard = { version = "1.2", optional = true }
 diskann-benchmark-core = { workspace = true, features = ["bigann"] }
 itertools.workspace = true
+dhat = { version = "0.3", optional = true }
 
 [lints]
 clippy.undocumented_unsafe_blocks = "warn"
@@ -51,6 +52,9 @@ half = { workspace = true, features = ["rand_distr", "num-traits"] }
 
 [features]
 default = []
+
+# Enable dhat-rs heap profiling for `cargo run` of the benchmark binary.
+heap-profiling = ["dep:dhat"]
 
 # Enable spherical-quantization based algorithms
 spherical-quantization = []

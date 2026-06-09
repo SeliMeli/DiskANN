@@ -6,14 +6,14 @@
 use std::fmt::Debug;
 
 use diskann_vector::{
-    DistanceFunction, PreprocessedDistanceFunction,
     conversion::CastFromSlice,
     distance::{DistanceProvider, Metric},
+    DistanceFunction, PreprocessedDistanceFunction,
 };
 use half::f16;
 use thiserror::Error;
 
-use crate::{ANNError, internal::convert_f32::ConvertF32};
+use crate::{internal::convert_f32::ConvertF32, ANNError};
 
 /// This is the data type for values stored in the graph. This type should implement the
 /// following traits:

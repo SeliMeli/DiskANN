@@ -14,6 +14,9 @@ pub use adjacencylist::AdjacencyList;
 pub mod config;
 pub use config::Config;
 
+pub mod hash_prune_reservoir;
+pub mod hashprune;
+
 pub mod index;
 pub use index::DiskANNIndex;
 

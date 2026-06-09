@@ -195,13 +195,13 @@ fn bench_partition(c: &mut Criterion) {
 
     for &(npoints, ndims) in &[(10_000, 128), (50_000, 128), (10_000, 384)] {
         let data = random_data(npoints, ndims, 42);
-        let indices: Vec<usize> = (0..npoints).collect();
         let config = PartitionConfig {
             c_max: 1024,
             c_min: 256,
             p_samp: 0.05,
             fanout: vec![8],
             metric: Metric::L2,
+            leader_cap: 1000,
         };
 
         group.throughput(Throughput::Elements(npoints as u64));
@@ -210,7 +210,7 @@ fn bench_partition(c: &mut Criterion) {
             &(),
             |b, _| {
                 b.iter(|| {
-                    partition::parallel_partition(&data, ndims, &indices, &config, 42);
+                    partition::partition(&data, ndims, npoints, &config, 42);
                 });
             },
         );

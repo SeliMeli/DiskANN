@@ -32,6 +32,63 @@ use opentelemetry::{
     KeyValue,
 };
 
+/// Get peak RSS in MB using OS-specific APIs.
+fn peak_rss_mb() -> f64 {
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::MaybeUninit;
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                pmc: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        unsafe {
+            let mut pmc = MaybeUninit::<ProcessMemoryCounters>::zeroed().assume_init();
+            pmc.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                return pmc.peak_working_set_size as f64 / (1024.0 * 1024.0);
+            }
+        }
+        0.0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Read VmPeak from /proc/self/status
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmPeak:") {
+                    if let Some(kb) = line.split_whitespace().nth(1) {
+                        if let Ok(kb) = kb.parse::<f64>() {
+                            return kb / 1024.0;
+                        }
+                    }
+                }
+            }
+        }
+        0.0
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        0.0
+    }
+}
+
 pub struct ChunkingParameters {
     pub chunking_config: ChunkingConfig,
     pub checkpoint_record_manager: Box<dyn CheckpointManager>,
@@ -174,6 +231,7 @@ where
 
     let diff = timer.elapsed();
     println!("Indexing time: {} seconds", diff.as_secs_f64());
+    println!("Peak RSS: {:.1} MB", peak_rss_mb());
 
     #[cfg(feature = "perf_test")]
     {

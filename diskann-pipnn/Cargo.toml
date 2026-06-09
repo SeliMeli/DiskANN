@@ -27,12 +27,22 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 criterion = { workspace = true }
+memmap2 = "0.9"
+once_cell = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+default = []
+bench-profiling = []
 
 [lints]
 workspace = true
 
 [[bench]]
 name = "pipnn_bench"
+harness = false
+
+[[bench]]
+name = "phase_profile"
 harness = false
