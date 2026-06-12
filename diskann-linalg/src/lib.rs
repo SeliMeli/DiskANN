@@ -6,6 +6,11 @@
 pub mod common;
 pub use common::Transpose;
 
+// oneMKL backend: u8 AMX-int8 Gram (cblas_gemm_s8u8s32) for BigANN/DEEP u8
+// leaf + partition GEMMs. f32/f16 keep the faer `sgemm_abt` path below.
+#[cfg(feature = "mkl")]
+pub mod mkl_raw;
+
 mod faer;
 use faer::{random_distance_preserving_matrix_impl, sgemm_impl, svd_into_impl};
 use rand::Rng;
@@ -187,6 +192,11 @@ pub fn sgemm_abt(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, c: &mut [f3
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), n * k);
     debug_assert_eq!(c.len(), m * n);
+    #[cfg(feature = "mkl")]
+    {
+        crate::mkl_raw::sgemm_abt(a, m, k, b, n, c);
+        return;
+    }
     sgemm(
         Transpose::None,
         Transpose::Ordinary,
@@ -221,12 +231,17 @@ pub fn sgemm_aat(a: &[f32], m: usize, k: usize, c: &mut [f32]) {
 pub fn sgemm_aat_lower(a: &[f32], m: usize, k: usize, c: &mut [f32]) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(c.len(), m * m);
+    #[cfg(feature = "mkl")]
+    {
+        crate::mkl_raw::ssyrk_aat_lower(a, m, k, c);
+        return;
+    }
     #[cfg(feature = "openblas")]
     {
         crate::openblas_raw::sgemm_aat_lower_openblas(a, m, k, c);
         return;
     }
-    #[cfg(not(feature = "openblas"))]
+    #[cfg(not(any(feature = "mkl", feature = "openblas")))]
     {
         crate::faer::sgemm_aat_lower_impl(m, k, a, c);
     }

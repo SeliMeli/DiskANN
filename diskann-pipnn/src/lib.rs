@@ -16,6 +16,7 @@ pub(crate) mod cpu_dispatch;
 pub mod hash_prune;
 pub mod leaf_build;
 pub mod partition;
+#[allow(dead_code)]
 pub(crate) mod partition_inner;
 pub(crate) mod rayon_util;
 

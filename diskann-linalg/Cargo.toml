@@ -20,6 +20,9 @@ rand.workspace = true
 # (Ubuntu's libopenblas-dev installs to /usr/lib/x86_64-linux-gnu).
 # Preferred over MKL because OpenBLAS lacks MKL's anti-AMD CPUID dispatch.
 openblas = []
+# Link libmkl_rt and expose the u8 AMX-int8 Gram (cblas_gemm_s8u8s32) for the
+# BigANN/DEEP u8 leaf + partition GEMMs. f32/f16 keep the faer path. Requires MKLROOT.
+mkl = []
 
 [lints]
 clippy.undocumented_unsafe_blocks = "warn"

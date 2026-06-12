@@ -49,6 +49,14 @@ pub(crate) struct LeafBuffers {
     /// insert reads from this buffer (cache-hot) instead of the global sketches
     /// array (multi-hundred-MB, cache-cold).
     pub local_sketches: Vec<f32>,
+    /// u8 AMX-int8 leaf Gram scratch (only filled on the `mkl` u8+L2 path).
+    /// `local_u8`: gathered raw u8 rows (no f32 convert). `leaf_s8`: centered
+    /// (b-128) operand. `rowsum_i64`: per-row sums for the +128·rowsum
+    /// correction. `s32`: the AMX s32 output for the full n×n triangular Gram.
+    pub local_u8: Vec<u8>,
+    pub leaf_s8: Vec<i8>,
+    pub rowsum_i64: Vec<i64>,
+    pub s32: Vec<i32>,
     /// Per-row top-k threshold (current k-th smallest distance) for the fused
     /// dual-end scan. Sized `n`. Initialised to `f32::MAX`.
     pub worst: Vec<f32>,
@@ -74,6 +82,10 @@ impl LeafBuffers {
             group_data: Vec::new(),
             cursor: Vec::new(),
             local_sketches: Vec::new(),
+            local_u8: Vec::new(),
+            leaf_s8: Vec::new(),
+            rowsum_i64: Vec::new(),
+            s32: Vec::new(),
             worst: Vec::new(),
         }
     }
@@ -145,6 +157,10 @@ pub(crate) fn release_thread_buffers() {
         bufs.group_starts = Vec::new();
         bufs.group_data = Vec::new();
         bufs.local_sketches = Vec::new();
+        bufs.local_u8 = Vec::new();
+        bufs.leaf_s8 = Vec::new();
+        bufs.rowsum_i64 = Vec::new();
+        bufs.s32 = Vec::new();
         bufs.worst = Vec::new();
     });
 }
@@ -822,8 +838,51 @@ pub(crate) fn build_leaf_with_buffers<T: VectorRepr + 'static>(
 
     let actual_k = if k == 0 || n <= 1 { 0 } else { k.min(n - 1) };
 
+    // Route the u8 + L2 Gram to AMX-int8 (cblas_gemm_s8u8s32) on RAW u8 — no
+    // u8->f32 convert, no faer. f32/f16 and non-L2 keep the faer SYRK path.
+    #[cfg(feature = "mkl")]
+    let use_mkl_u8 =
+        std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>() && matches!(metric, Metric::L2);
+    #[cfg(not(feature = "mkl"))]
+    let use_mkl_u8 = false;
+
     // ───── Gather (norms computed below from the SYRK diagonal) ─────
-    {
+    if use_mkl_u8 {
+        #[cfg(feature = "mkl")]
+        {
+            // SAFETY: T == u8 (TypeId checked above), so &[T] and &[u8] are layout-identical.
+            let data_u8: &[u8] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+            let nd = n * ndims;
+            if bufs.local_u8.len() < nd {
+                bufs.local_u8.resize(nd, 0);
+            }
+            if bufs.leaf_s8.len() < nd {
+                bufs.leaf_s8.resize(nd, 0);
+            }
+            if bufs.rowsum_i64.len() < n {
+                bufs.rowsum_i64.resize(n, 0);
+            }
+            // Gather raw u8 rows (no conversion).
+            {
+                let local_u8 = &mut bufs.local_u8[..nd];
+                for (i, &idx) in indices.iter().enumerate() {
+                    let idx = idx as usize;
+                    local_u8[i * ndims..(i + 1) * ndims]
+                        .copy_from_slice(&data_u8[idx * ndims..(idx + 1) * ndims]);
+                }
+            }
+            // Center the B operand (b-128) -> s8 once, and per-row sums for the
+            // +128·rowsum correction inside gram_u8_aat_lower.
+            diskann_linalg::mkl_raw::u8_center_to_s8(&bufs.local_u8[..nd], &mut bufs.leaf_s8[..nd]);
+            diskann_linalg::mkl_raw::u8_row_sums(
+                &bufs.local_u8[..nd],
+                n,
+                ndims,
+                &mut bufs.rowsum_i64[..n],
+            );
+        }
+    } else {
         let local_data = &mut bufs.local_data[..n * ndims];
         for (i, &idx) in indices.iter().enumerate() {
             crate::partition::gather_f16_to_f32_simd(
@@ -847,7 +906,27 @@ pub(crate) fn build_leaf_with_buffers<T: VectorRepr + 'static>(
         // norm we used to compute in a separate pass. We read it directly
         // below, skipping `compute_p_norm_sq_batch_into` entirely (saves one
         // streaming read of the n × ndims data matrix per leaf).
-        {
+        if use_mkl_u8 {
+            #[cfg(feature = "mkl")]
+            {
+                // AMX-int8 triangular Gram on raw u8: writes the lower triangle
+                // of C = A·Aᵀ (raw u8 dots, +128·rowsum correction applied).
+                // The diagonal dot[i*n+i] = ‖x_i‖² exactly, so Steps 2/3 below
+                // (norm read + fused dual top-k) produce the identical graph.
+                if bufs.s32.len() < n * n {
+                    bufs.s32.resize(n * n, 0);
+                }
+                let nd = n * ndims;
+                // SAFETY: local_u8/leaf_s8/rowsum_i64/s32/dot_matrix are disjoint
+                // bufs fields; all slices stay in-bounds for this n×n Gram.
+                let a_u8 = unsafe { std::slice::from_raw_parts(bufs.local_u8.as_ptr(), nd) };
+                let a_s8 = unsafe { std::slice::from_raw_parts(bufs.leaf_s8.as_ptr(), nd) };
+                let rowsum = unsafe { std::slice::from_raw_parts(bufs.rowsum_i64.as_ptr(), n) };
+                let s32 = unsafe { std::slice::from_raw_parts_mut(bufs.s32.as_mut_ptr(), n * n) };
+                let dot = unsafe { std::slice::from_raw_parts_mut(bufs.dot_matrix.as_mut_ptr(), n * n) };
+                diskann_linalg::mkl_raw::gram_u8_aat_lower(a_u8, a_s8, n, ndims, rowsum, s32, dot);
+            }
+        } else {
             let a_full = &bufs.local_data[..n * ndims];
             let dot = &mut bufs.dot_matrix[..n * n];
             diskann_linalg::sgemm_aat_lower(a_full, n, ndims, dot);
