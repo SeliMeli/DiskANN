@@ -27,6 +27,26 @@ fn computes_lower_triangle_and_preserves_upper_triangle() {
 }
 
 #[test]
+fn accepts_a_matrix_with_no_rows() {
+    sgemm_aat_lower(&[], 0, 3, &mut []).unwrap();
+}
+
+#[test]
+fn zero_inner_dimension_zeros_only_the_lower_triangle() {
+    let untouched = -123.0;
+    let mut c = [untouched; 9];
+
+    sgemm_aat_lower(&[], 3, 0, &mut c).unwrap();
+
+    #[rustfmt::skip]
+    assert_eq!(c, [
+        0.0, untouched, untouched,
+        0.0,       0.0, untouched,
+        0.0,       0.0,       0.0,
+    ]);
+}
+
+#[test]
 fn rejects_invalid_input_dimensions() {
     let mut c = [0.0; 4];
 
