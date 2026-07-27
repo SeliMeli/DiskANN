@@ -63,6 +63,14 @@ fn rejects_each_invalid_algorithm_parameter() {
             ..pipnn_config()
         },
         PiPNNConfig {
+            p_samp: -0.01,
+            ..pipnn_config()
+        },
+        PiPNNConfig {
+            p_samp: 1.01,
+            ..pipnn_config()
+        },
+        PiPNNConfig {
             p_samp: f64::NAN,
             ..pipnn_config()
         },
