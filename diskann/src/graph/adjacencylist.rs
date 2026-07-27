@@ -99,6 +99,19 @@ where
         }
     }
 
+    /// Fallible counterpart to [`Self::push`].
+    pub fn try_push(&mut self, i: I) -> Result<bool, std::collections::TryReserveError>
+    where
+        I: ContainsSimd,
+    {
+        if self.contains(i) {
+            return Ok(false);
+        }
+        self.edges.try_reserve(1)?;
+        self.edges.push(i);
+        Ok(true)
+    }
+
     /// Append all elements of `is` that are not already in the list. Duplicates within `is`
     /// will be removed.
     ///
@@ -112,6 +125,21 @@ where
         I: ContainsSimd,
     {
         is.iter().filter(|&i| self.push(*i)).count()
+    }
+
+    /// Fallible counterpart to [`Self::extend_from_slice`].
+    pub fn try_extend_from_slice(
+        &mut self,
+        is: &[I],
+    ) -> Result<usize, std::collections::TryReserveError>
+    where
+        I: ContainsSimd,
+    {
+        let mut inserted = 0;
+        for &i in is {
+            inserted += usize::from(self.try_push(i)?);
+        }
+        Ok(inserted)
     }
 
     /// Check if the slice contains the given node.
@@ -646,6 +674,16 @@ mod tests {
 
         assert_eq!(x.extend_from_slice(&[]), 0);
         assert_eq!(&*x, &[1, 2, 3, 4, 5, 9, 10, 8]);
+    }
+
+    #[test]
+    fn test_fallible_insertion() {
+        let mut x = AdjacencyList::from_iter_untrusted([1_u32, 2]);
+
+        assert!(!x.try_push(2).unwrap());
+        assert!(x.try_push(3).unwrap());
+        assert_eq!(x.try_extend_from_slice(&[1, 4, 4, 5]).unwrap(), 2);
+        assert_eq!(&*x, &[1, 2, 3, 4, 5]);
     }
 
     fn test_extend_from_slice_fuzz_impl(

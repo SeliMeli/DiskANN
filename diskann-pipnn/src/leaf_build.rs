@@ -159,7 +159,8 @@ impl DirectCandidates {
             // Every point ID is validated before leaf-local work begins.
             let row = &self.rows[source as usize];
             let mut row = row.lock().map_err(|_| poisoned_row(source))?;
-            row.extend_from_slice(additions);
+            row.try_extend_from_slice(additions)
+                .map_err(|source| allocation_error("candidate adjacency row", 1, source))?;
         }
         Ok(())
     }
@@ -301,8 +302,12 @@ fn add_symmetric_edges(
             };
             let source_id = point_ids[source];
             if source_id != target_id {
-                local_graph[source].push(target_id);
-                local_graph[target].push(source_id);
+                local_graph[source]
+                    .try_push(target_id)
+                    .map_err(|source| allocation_error("leaf adjacency row", 1, source))?;
+                local_graph[target]
+                    .try_push(source_id)
+                    .map_err(|source| allocation_error("leaf adjacency row", 1, source))?;
             }
         }
     }
