@@ -143,18 +143,26 @@ fn supports_every_source_type_and_metric() {
 #[test]
 fn integer_normalized_cosine_matches_cosine() {
     fn assert_match<T: diskann::utils::VectorRepr + Send + Sync + 'static>(values: &[T]) {
-        let data = MatrixView::try_from(values, 3, 2).unwrap();
+        let data = MatrixView::try_from(values, 8, 2).unwrap();
         let pool = pool(2);
         let build = |metric| {
             let graph = graph_config(metric, 2);
-            let context = PiPNNBuildContext::new(pipnn_config(), &graph, metric, &pool).unwrap();
+            let config = PiPNNConfig {
+                c_max: 8,
+                c_min: 1,
+                p_samp: 0.5,
+                fanout: vec![2],
+                k: 1,
+                replicas: 1,
+            };
+            let context = PiPNNBuildContext::new(config, &graph, metric, &pool).unwrap();
             rows(build_graph(data, &context).unwrap())
         };
         assert_eq!(build(Metric::CosineNormalized), build(Metric::Cosine));
     }
 
-    assert_match(&[1_u8, 0, 100, 10, 250, 250]);
-    assert_match(&[1_i8, 0, 100, 10, 120, 120]);
+    assert_match(&[1_u8, 0, 100, 1, 2, 0, 0, 1, 1, 1, 200, 2, 2, 1, 1, 2]);
+    assert_match(&[1_i8, 0, 100, 1, 2, 0, 0, 1, 1, 1, 120, 2, 2, 1, 1, 2]);
 }
 
 #[test]
