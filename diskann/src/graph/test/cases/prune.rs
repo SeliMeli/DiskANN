@@ -21,18 +21,29 @@ struct PruneCase {
     source: u32,
 }
 
+struct PruneParams {
+    degree: usize,
+    alpha: f32,
+    prune_kind: PruneKind,
+    saturate: bool,
+    max_occlusion_size: usize,
+}
+
 impl PruneCase {
     fn new(
         metric: Metric,
         vectors: Vec<Vec<f32>>,
         source: u32,
         candidates: impl IntoIterator<Item = u32>,
-        degree: usize,
-        alpha: f32,
-        prune_kind: PruneKind,
-        saturate: bool,
-        max_occlusion_size: usize,
+        params: PruneParams,
     ) -> Self {
+        let PruneParams {
+            degree,
+            alpha,
+            prune_kind,
+            saturate,
+            max_occlusion_size,
+        } = params;
         let dimensions = vectors.first().expect("a source vector is required").len();
         assert!(vectors.iter().all(|vector| vector.len() == dimensions));
         assert!((source as usize) < vectors.len());
@@ -120,11 +131,13 @@ fn l2_case(
         positions.iter().map(|position| vec![*position]).collect(),
         0,
         candidates,
-        degree,
-        alpha,
-        PruneKind::TriangleInequality,
-        saturate,
-        max_occlusion_size,
+        PruneParams {
+            degree,
+            alpha,
+            prune_kind: PruneKind::TriangleInequality,
+            saturate,
+            max_occlusion_size,
+        },
     )
 }
 
@@ -151,11 +164,13 @@ async fn equal_distances_keep_current_sorted_neighbor_order() {
         ],
         0,
         [3, 1, 2],
-        2,
-        1.2,
-        PruneKind::TriangleInequality,
-        false,
-        10,
+        PruneParams {
+            degree: 2,
+            alpha: 1.2,
+            prune_kind: PruneKind::TriangleInequality,
+            saturate: false,
+            max_occlusion_size: 10,
+        },
     );
 
     assert_eq!(&*case.run(&test_provider::Strategy::new()).await, &[2, 1]);
@@ -200,11 +215,13 @@ async fn inner_product_uses_occluding_prune() {
         ],
         0,
         [1, 2, 3],
-        2,
-        1.2,
-        PruneKind::Occluding,
-        false,
-        10,
+        PruneParams {
+            degree: 2,
+            alpha: 1.2,
+            prune_kind: PruneKind::Occluding,
+            saturate: false,
+            max_occlusion_size: 10,
+        },
     );
 
     assert_eq!(&*case.run(&test_provider::Strategy::new()).await, &[1, 2]);
@@ -232,6 +249,14 @@ async fn self_and_unavailable_candidates_are_excluded() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn unavailable_candidates_stay_excluded_at_maximum_alpha() {
+    let case = l2_case(&[0.0, -1.0, 2.0, 3.0], [0, 1, 2, 3], 3, f32::MAX, false, 10);
+    let strategy = test_provider::Strategy::with_transient(true, [2]);
+
+    assert_eq!(&*case.run(&strategy).await, &[1, 3]);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn max_occlusion_size_truncates_to_nearest_candidates() {
     let case = PruneCase::new(
         Metric::L2,
@@ -244,11 +269,13 @@ async fn max_occlusion_size_truncates_to_nearest_candidates() {
         ],
         0,
         [4, 3, 2, 1],
-        3,
-        1.2,
-        PruneKind::TriangleInequality,
-        false,
-        2,
+        PruneParams {
+            degree: 3,
+            alpha: 1.2,
+            prune_kind: PruneKind::TriangleInequality,
+            saturate: false,
+            max_occlusion_size: 2,
+        },
     );
 
     assert_eq!(&*case.run(&test_provider::Strategy::new()).await, &[1, 2]);
@@ -265,11 +292,13 @@ async fn maximum_u16_candidate_pool_is_supported() {
         vectors,
         0,
         1..=u16::MAX as u32,
-        1,
-        1.2,
-        PruneKind::TriangleInequality,
-        false,
-        num_candidates,
+        PruneParams {
+            degree: 1,
+            alpha: 1.2,
+            prune_kind: PruneKind::TriangleInequality,
+            saturate: false,
+            max_occlusion_size: num_candidates,
+        },
     );
 
     let strategy = test_provider::Strategy::with_transient(true, 1..u16::MAX as u32);

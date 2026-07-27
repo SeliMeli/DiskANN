@@ -61,6 +61,14 @@ impl<I> AdjacencyList<I> {
         self.edges.clear();
     }
 
+    /// Reserve storage without aborting the process on allocation failure.
+    pub(crate) fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.edges.try_reserve(additional)
+    }
+
     /// Shrink the list to at most `len` items long. If the current length is less than
     /// or equal to `len`, no change is made.
     pub fn truncate(&mut self, len: usize) {
@@ -165,6 +173,19 @@ where
     {
         self.edges.resize(capacity, I::default());
         ResizeGuard(self)
+    }
+
+    /// Fallible counterpart to [`Self::resize`] for allocation-sensitive internals.
+    pub(crate) fn try_resize(
+        &mut self,
+        capacity: usize,
+    ) -> Result<ResizeGuard<'_, I>, std::collections::TryReserveError>
+    where
+        I: Default + ContainsSimd,
+    {
+        self.edges
+            .try_reserve(capacity.saturating_sub(self.edges.len()))?;
+        Ok(self.resize(capacity))
     }
 
     //-----------//
@@ -737,5 +758,13 @@ mod tests {
             guard.finish(0);
         }
         assert!(x.is_empty());
+    }
+
+    #[test]
+    fn try_resize_reports_capacity_overflow() {
+        let mut list = AdjacencyList::<u32>::new();
+
+        assert!(list.try_resize(usize::MAX).is_err());
+        assert!(list.is_empty());
     }
 }
