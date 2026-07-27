@@ -340,7 +340,7 @@ where
             if neighbors.len() >= policy.degree {
                 break;
             }
-            if !exclude(candidate.id) && is_available(candidate.id) {
+            if !exclude(candidate.id) {
                 neighbors.push(candidate.id);
             }
         }
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn saturation_excludes_unavailable_candidates() {
+    fn saturation_replays_unavailable_candidates() {
         let mut scratch = scratch_with_candidates(3);
 
         robust_prune(
@@ -461,7 +461,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(scratch.neighbors().as_ref(), &[0, 2]);
+        assert_eq!(scratch.neighbors().as_ref(), &[0, 1, 2]);
     }
 
     #[test]
