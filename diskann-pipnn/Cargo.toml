@@ -29,5 +29,9 @@ half.workspace = true
 name = "kernels"
 harness = false
 
+[[bench]]
+name = "core"
+harness = false
+
 [lints]
 workspace = true
