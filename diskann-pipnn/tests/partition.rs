@@ -4,7 +4,7 @@
  */
 
 use diskann_pipnn::partition::{
-    MAX_PARTITION_FANOUT, PartitionKernelError, PartitionTopK, nearest_leaders,
+    nearest_leaders, PartitionKernelError, PartitionTopK, MAX_PARTITION_FANOUT,
 };
 use diskann_vector::distance::Metric;
 
@@ -165,6 +165,23 @@ fn accepts_empty_rows_and_zero_fanout() {
         &mut [],
     )
     .unwrap();
+
+    // `u32::MAX` leaders still have positions representable by `u32`: the
+    // largest position is `u32::MAX - 1`. An empty batch lets us exercise the
+    // validation boundary without allocating the declared tile.
+    nearest_leaders(
+        PartitionTopK {
+            dots: &[],
+            rows: 0,
+            leaders: u32::MAX as usize,
+            row_scales: &[],
+            leader_scales: &[],
+            metric: Metric::InnerProduct,
+        },
+        0,
+        &mut [],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -209,6 +226,33 @@ fn rejects_inconsistent_shapes_and_fanout() {
             maximum: MAX_PARTITION_FANOUT,
         })
     );
+
+    let one_leader = PartitionTopK {
+        dots: &[0.0],
+        rows: 1,
+        leaders: 1,
+        row_scales: &[],
+        leader_scales: &[],
+        metric: Metric::InnerProduct,
+    };
+    assert_eq!(
+        nearest_leaders(one_leader, 2, &mut []),
+        Err(PartitionKernelError::InvalidFanout {
+            fanout: 2,
+            leaders: 1,
+            maximum: MAX_PARTITION_FANOUT,
+        })
+    );
+
+    let exact_maximum = PartitionTopK {
+        dots: &[],
+        rows: 0,
+        leaders: MAX_PARTITION_FANOUT,
+        row_scales: &[],
+        leader_scales: &[],
+        metric: Metric::InnerProduct,
+    };
+    nearest_leaders(exact_maximum, MAX_PARTITION_FANOUT, &mut []).unwrap();
 }
 
 #[test]

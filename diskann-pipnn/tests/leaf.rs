@@ -120,6 +120,17 @@ fn preserves_pipnn_metric_edge_semantics() {
         1.0,                    1.0,
     ];
     assert_eq!(run(&subnormal, 2, 1, Metric::Cosine).1[0].distance, 1.0);
+
+    let minimum_normal_squared_norm = f32::MIN_POSITIVE;
+    #[rustfmt::skip]
+    let minimum_normal = [
+        minimum_normal_squared_norm,          0.0,
+        minimum_normal_squared_norm.sqrt(),   1.0,
+    ];
+    assert_eq!(
+        run(&minimum_normal, 2, 1, Metric::Cosine).1[0].distance,
+        0.0
+    );
 }
 
 #[test]
@@ -288,4 +299,33 @@ fn rejects_shape_overflow_before_reading_buffers() {
     .unwrap_err();
 
     assert_eq!(error, LeafKernelError::TooManyPoints(usize::MAX));
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn accepts_the_largest_representable_point_count_before_shape_validation() {
+    let points = u32::MAX as usize;
+    let expected = points.checked_mul(points).unwrap();
+    let mut workspace = LeafTopKWorkspace::new();
+
+    let error = nearest_leaf_neighbors(
+        LeafTopK {
+            dots: &[],
+            points,
+            metric: Metric::InnerProduct,
+        },
+        0,
+        &mut [],
+        &mut workspace,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        LeafKernelError::InvalidBufferLength {
+            buffer: "lower dot-product matrix",
+            expected,
+            actual: 0,
+        }
+    );
 }
