@@ -70,6 +70,14 @@ pub enum PartitionKernelError {
     /// Leader positions cannot be represented as `u32`.
     #[error("leader count {0} exceeds the u32 position limit")]
     TooManyLeaders(usize),
+    /// A row did not contain enough rankable distances to fill its output.
+    #[error("row {row} has fewer than {fanout} rankable leader distances")]
+    InsufficientRankableDistances {
+        /// Zero-based row position in the input tile.
+        row: usize,
+        /// Requested number of leader positions.
+        fanout: usize,
+    },
 }
 
 /// Select the nearest `fanout` leader positions for every input row.
@@ -95,6 +103,12 @@ pub fn nearest_leaders(
         fanout,
         output,
     });
+    if let Some(row) = output
+        .chunks_exact(fanout)
+        .position(|leaders| leaders.contains(&u32::MAX))
+    {
+        return Err(PartitionKernelError::InsufficientRankableDistances { row, fanout });
+    }
     Ok(())
 }
 

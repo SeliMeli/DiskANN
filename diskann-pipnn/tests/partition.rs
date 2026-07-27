@@ -4,7 +4,7 @@
  */
 
 use diskann_pipnn::partition::{
-    nearest_leaders, PartitionKernelError, PartitionTopK, MAX_PARTITION_FANOUT,
+    MAX_PARTITION_FANOUT, PartitionKernelError, PartitionTopK, nearest_leaders,
 };
 use diskann_vector::distance::Metric;
 
@@ -112,6 +112,28 @@ fn ignores_nan_distances_without_displacing_finite_leaders() {
     .unwrap();
 
     assert_eq!(assignments, [1, 2]);
+}
+
+#[test]
+fn rejects_rows_with_too_few_rankable_distances() {
+    let error = nearest_leaders(
+        PartitionTopK {
+            dots: &[f32::NAN, 3.0],
+            rows: 1,
+            leaders: 2,
+            row_scales: &[],
+            leader_scales: &[],
+            metric: Metric::InnerProduct,
+        },
+        2,
+        &mut [u32::MAX; 2],
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        PartitionKernelError::InsufficientRankableDistances { row: 0, fanout: 2 }
+    );
 }
 
 #[test]
