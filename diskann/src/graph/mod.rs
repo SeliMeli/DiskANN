@@ -38,6 +38,11 @@ pub use search::{KnnSearchError, RangeSearchError, Search};
 
 mod internal;
 
+/// Provider-independent Vamana RobustPrune kernel.
+pub mod prune {
+    pub use super::internal::prune::{Policy, RobustPruneError, Scratch, robust_prune};
+}
+
 pub mod strategy;
 
 // Integration tests and test providers.

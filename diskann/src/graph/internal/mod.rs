@@ -9,4 +9,4 @@ pub(super) use sorted_neighbors::SortedNeighbors;
 mod backedge;
 pub(super) use backedge::BackedgeBuffer;
 
-pub(super) mod prune;
+pub(crate) mod prune;
