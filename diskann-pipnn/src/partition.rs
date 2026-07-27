@@ -416,7 +416,40 @@ mod tests {
 
     fn expected(input: PartitionTopK<'_>, fanout: usize) -> Vec<u32> {
         let mut output = vec![u32::MAX; input.rows * fanout];
-        process_rows_scalar(input, fanout, &mut output);
+        for (row_index, (dots, output)) in input
+            .dots
+            .chunks_exact(input.leaders)
+            .zip(output.chunks_exact_mut(fanout))
+            .enumerate()
+        {
+            let row_scale = input.row_scales.get(row_index).copied().unwrap_or(0.0);
+            let mut candidates: Vec<_> = dots
+                .iter()
+                .enumerate()
+                .filter_map(|(leader, &dot)| {
+                    let leader_scale = input.leader_scales.get(leader).copied().unwrap_or(0.0);
+                    let distance = match input.metric {
+                        Metric::L2 => leader_scale - 2.0 * dot,
+                        Metric::CosineNormalized => 1.0 - dot,
+                        Metric::InnerProduct => -dot,
+                        Metric::Cosine => {
+                            let denominator = row_scale.sqrt() * leader_scale;
+                            1.0 - if denominator > 0.0 {
+                                dot / denominator
+                            } else {
+                                0.0
+                            }
+                        }
+                    };
+                    (distance.partial_cmp(&f32::MAX) == Some(std::cmp::Ordering::Less))
+                        .then_some((leader as u32, distance))
+                })
+                .collect();
+            candidates.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap());
+            for (destination, (leader, _)) in output.iter_mut().zip(candidates) {
+                *destination = leader;
+            }
+        }
         output
     }
 
@@ -490,6 +523,8 @@ mod tests {
                 .map(|leader| {
                     if leader == 1 {
                         0.0
+                    } else if leader == 2 || leader == 3 {
+                        3.0
                     } else {
                         1.0 + leader as f32
                     }
@@ -497,7 +532,11 @@ mod tests {
                 .collect(),
             Metric::L2 => (0..leaders)
                 .map(|leader| {
-                    let norm = leader as f32 + 1.0;
+                    let norm = if leader == 2 || leader == 3 {
+                        3.0
+                    } else {
+                        leader as f32 + 1.0
+                    };
                     norm * norm
                 })
                 .collect(),
@@ -507,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn every_available_architecture_matches_scalar_across_width_boundaries() {
+    fn every_available_architecture_matches_reference_across_width_boundaries() {
         for metric in [
             Metric::L2,
             Metric::Cosine,
