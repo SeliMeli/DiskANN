@@ -7,6 +7,7 @@
 
 pub mod leaf;
 pub mod partition;
+mod leaf_build;
 mod partitioning;
 
 use diskann::{graph::Config, ANNError, ANNResult};

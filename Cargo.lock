@@ -666,6 +666,7 @@ dependencies = [
  "diskann-vector",
  "diskann-wide",
  "rand",
+ "half",
  "rayon",
  "thiserror 2.0.17",
 ]
