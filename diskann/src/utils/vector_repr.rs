@@ -67,6 +67,11 @@ pub trait VectorRepr: VectorElement {
         + Sync
         + 'static;
 
+    /// Return the metric actually implemented by this representation.
+    fn effective_metric(metric: Metric) -> Metric {
+        metric
+    }
+
     /// Return the dimension of the vector when converted into a full-precision vector.
     ///
     /// For most implementations of `VectorRepr` this simply outputs the length of the input
@@ -125,11 +130,16 @@ macro_rules! default_impl {
         QueryDistance = $QueryDistance:ty,
         query_impl = $query_impl:expr,
         into_impl = $into_impl:expr
+        $(, effective_metric = $effective_metric:expr)?
     ) => {
         impl VectorRepr for $T {
             type Error = NativeTypeLengthError;
             type Distance = diskann_vector::distance::Distance<$T, $T>;
             type QueryDistance = $QueryDistance;
+
+            $(fn effective_metric(metric: Metric) -> Metric {
+                ($effective_metric)(metric)
+            })?
 
             fn distance(metric: Metric, dim: Option<usize>) -> Self::Distance {
                 <$T>::distance_comparer(metric, dim)
@@ -157,23 +167,33 @@ macro_rules! default_impl {
         }
     };
     ($T:ty) => {
-    default_impl!(
-        $T,
-        QueryDistance = BufferedDistance<$T>,
-        query_impl = |query : &[$T], metric| {
-            BufferedDistance::new(query.into(), metric)
-        },
-        into_impl = |src : &[$T], dst : &mut [f32]| {
-            for (d, x) in dst.iter_mut().zip(src.iter()) {
-                *d = (*x).into();
+        default_impl!(@native $T);
+    };
+    (@integer $T:ty) => {
+        default_impl!(@native $T, effective_metric = |metric| match metric {
+            Metric::CosineNormalized => Metric::Cosine,
+            metric => metric,
+        });
+    };
+    (@native $T:ty $(, effective_metric = $effective_metric:expr)?) => {
+        default_impl!(
+            $T,
+            QueryDistance = BufferedDistance<$T>,
+            query_impl = |query : &[$T], metric| {
+                BufferedDistance::new(query.into(), metric)
+            },
+            into_impl = |src : &[$T], dst : &mut [f32]| {
+                for (d, x) in dst.iter_mut().zip(src.iter()) {
+                    *d = (*x).into();
+                }
             }
-        }
-    );
+            $(, effective_metric = $effective_metric)?
+        );
     };
 }
 
-default_impl!(i8);
-default_impl!(u8);
+default_impl!(@integer i8);
+default_impl!(@integer u8);
 
 default_impl!(
     f32,

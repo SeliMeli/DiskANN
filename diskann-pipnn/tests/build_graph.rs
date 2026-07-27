@@ -141,6 +141,23 @@ fn supports_every_source_type_and_metric() {
 }
 
 #[test]
+fn integer_normalized_cosine_matches_cosine() {
+    fn assert_match<T: diskann::utils::VectorRepr + Send + Sync + 'static>(values: &[T]) {
+        let data = MatrixView::try_from(values, 3, 2).unwrap();
+        let pool = pool(2);
+        let build = |metric| {
+            let graph = graph_config(metric, 2);
+            let context = PiPNNBuildContext::new(pipnn_config(), &graph, metric, &pool).unwrap();
+            rows(build_graph(data, &context).unwrap())
+        };
+        assert_eq!(build(Metric::CosineNormalized), build(Metric::Cosine));
+    }
+
+    assert_match(&[1_u8, 0, 100, 10, 250, 250]);
+    assert_match(&[1_i8, 0, 100, 10, 120, 120]);
+}
+
+#[test]
 fn is_deterministic_for_a_fixed_pool_size() {
     let data: Vec<f32> = (0..96 * 4)
         .map(|value| ((value * 17 + 3) % 101) as f32)

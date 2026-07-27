@@ -167,15 +167,16 @@ where
             data.ncols()
         ))
     })?;
+    let metric = T::effective_metric(context.metric);
 
     let leaves = tracing::info_span!("pipnn.partition")
-        .in_scope(|| partitioning::partition(data, &context.config, context.metric))?;
+        .in_scope(|| partitioning::partition(data, &context.config, metric))?;
     let candidates = tracing::info_span!("pipnn.leaf_build").in_scope(|| {
-        leaf_build::build_leaf_candidates(data, &leaves, context.config.k, context.metric)
+        leaf_build::build_leaf_candidates(data, &leaves, context.config.k, metric)
             .map_err(ANNError::opaque)
     })?;
     tracing::info_span!("pipnn.finalization")
-        .in_scope(|| finalization::prune_overfull(data, candidates, context.graph, context.metric))
+        .in_scope(|| finalization::prune_overfull(data, candidates, context.graph, metric))
 }
 
 #[track_caller]
