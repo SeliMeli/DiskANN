@@ -5,4 +5,5 @@
 
 //! PiPNN graph construction.
 
+pub mod leaf;
 pub mod partition;
