@@ -33,12 +33,6 @@ const PARALLEL_SCATTER_MIN_POINTS: usize = 100_000;
 const SCATTER_STRIPE_ROWS: usize = 64 * 1024;
 const MAX_PARTITION_ITERATIONS: usize = 30;
 
-/// A bounded partition containing IDs into the original dataset.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Leaf {
-    pub(crate) indices: Vec<u32>,
-}
-
 /// A partition failure with enough context to diagnose non-progressing input.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum PartitionError {
@@ -95,7 +89,7 @@ pub(crate) fn partition<T>(
     data: MatrixView<'_, T>,
     config: &PiPNNConfig,
     metric: Metric,
-) -> ANNResult<Vec<Leaf>>
+) -> ANNResult<Vec<Vec<u32>>>
 where
     T: VectorRepr + Send + Sync,
 {
@@ -128,7 +122,7 @@ fn partition_replica<T>(
     config: &PiPNNConfig,
     metric: Metric,
     seed: u64,
-) -> ANNResult<Vec<Leaf>>
+) -> ANNResult<Vec<Vec<u32>>>
 where
     T: VectorRepr + Send + Sync,
 {
@@ -136,9 +130,7 @@ where
     if data.nrows() <= config.c_max {
         let mut leaves = Vec::new();
         leaves.try_reserve_exact(1).map_err(ANNError::opaque)?;
-        leaves.push(Leaf {
-            indices: initial_indices,
-        });
+        leaves.push(initial_indices);
         return Ok(leaves);
     }
 
@@ -208,7 +200,7 @@ fn partition_one_level<T>(
     config: &PiPNNConfig,
     metric: Metric,
     item: WorkItem,
-) -> ANNResult<(Vec<WorkItem>, Vec<Leaf>)>
+) -> ANNResult<(Vec<WorkItem>, Vec<Vec<u32>>)>
 where
     T: VectorRepr + Send + Sync,
 {
@@ -235,7 +227,7 @@ where
             continue;
         }
         if cluster.len() <= config.c_max {
-            finished.push(Leaf { indices: cluster });
+            finished.push(cluster);
         } else {
             pending.push(WorkItem {
                 indices: cluster,
@@ -487,7 +479,11 @@ fn clusters_with_capacities(sizes: &[usize]) -> ANNResult<Vec<Vec<u32>>> {
     Ok(clusters)
 }
 
-fn global_merge_small(leaves: Vec<Leaf>, c_min: usize, c_max: usize) -> ANNResult<Vec<Leaf>> {
+fn global_merge_small(
+    leaves: Vec<Vec<u32>>,
+    c_min: usize,
+    c_max: usize,
+) -> ANNResult<Vec<Vec<u32>>> {
     let mut merged = Vec::new();
     let mut small_leaves = Vec::new();
     merged.try_reserve(leaves.len()).map_err(ANNError::opaque)?;
@@ -495,7 +491,7 @@ fn global_merge_small(leaves: Vec<Leaf>, c_min: usize, c_max: usize) -> ANNResul
         .try_reserve(leaves.len())
         .map_err(ANNError::opaque)?;
     for leaf in leaves {
-        if leaf.indices.len() >= c_min {
+        if leaf.len() >= c_min {
             merged.push(leaf);
         } else {
             small_leaves.push(leaf);
@@ -509,26 +505,20 @@ fn global_merge_small(leaves: Vec<Leaf>, c_min: usize, c_max: usize) -> ANNResul
     small.try_reserve(c_max).map_err(ANNError::opaque)?;
 
     for leaf in small_leaves {
-        let combined = small.len().checked_add(leaf.indices.len()).ok_or_else(|| {
+        let combined = small.len().checked_add(leaf.len()).ok_or_else(|| {
             ANNError::opaque(PartitionError::ShapeOverflow {
                 buffer: "small-leaf merge",
                 rows: small.len(),
-                cols: leaf.indices.len(),
+                cols: leaf.len(),
             })
         })?;
-        if combined > c_max && small.len() >= c_min {
-            merged.push(Leaf {
-                indices: drain_sorted(&mut small)?,
-            });
+        if combined > c_max {
+            merged.push(drain_sorted(&mut small)?);
         }
-        small
-            .try_reserve(leaf.indices.len())
-            .map_err(ANNError::opaque)?;
-        small.extend(leaf.indices);
+        small.try_reserve(leaf.len()).map_err(ANNError::opaque)?;
+        small.extend(leaf);
         if small.len() >= c_min {
-            merged.push(Leaf {
-                indices: drain_sorted(&mut small)?,
-            });
+            merged.push(drain_sorted(&mut small)?);
         }
     }
 
@@ -536,29 +526,24 @@ fn global_merge_small(leaves: Vec<Leaf>, c_min: usize, c_max: usize) -> ANNResul
         let mut remainder = drain_sorted(&mut small)?;
         if remainder.len() < c_min {
             if let Some(last) = merged.last_mut() {
-                remainder.retain(|id| !last.indices.contains(id));
-                let combined =
-                    last.indices
-                        .len()
-                        .checked_add(remainder.len())
-                        .ok_or_else(|| {
-                            ANNError::opaque(PartitionError::ShapeOverflow {
-                                buffer: "small-leaf tail merge",
-                                rows: last.indices.len(),
-                                cols: remainder.len(),
-                            })
-                        })?;
+                remainder.retain(|id| !last.contains(id));
+                let combined = last.len().checked_add(remainder.len()).ok_or_else(|| {
+                    ANNError::opaque(PartitionError::ShapeOverflow {
+                        buffer: "small-leaf tail merge",
+                        rows: last.len(),
+                        cols: remainder.len(),
+                    })
+                })?;
                 if combined <= c_max {
-                    last.indices
-                        .try_reserve(remainder.len())
+                    last.try_reserve(remainder.len())
                         .map_err(ANNError::opaque)?;
-                    last.indices.append(&mut remainder);
-                    last.indices.sort_unstable();
+                    last.append(&mut remainder);
+                    last.sort_unstable();
                 }
             }
         }
         if !remainder.is_empty() {
-            merged.push(Leaf { indices: remainder });
+            merged.push(remainder);
         }
     }
 
@@ -576,13 +561,13 @@ fn drain_sorted(set: &mut HashSet<u32>) -> ANNResult<Vec<u32>> {
     Ok(values)
 }
 
-fn validate_leaves(leaves: &[Leaf], c_max: usize) -> ANNResult<()> {
+fn validate_leaves(leaves: &[Vec<u32>], c_max: usize) -> ANNResult<()> {
     if let Some(leaf) = leaves
         .iter()
-        .find(|leaf| leaf.indices.is_empty() || leaf.indices.len() > c_max)
+        .find(|leaf| leaf.is_empty() || leaf.len() > c_max)
     {
         return Err(ANNError::opaque(PartitionError::InvalidLeaf {
-            size: leaf.indices.len(),
+            size: leaf.len(),
             limit: c_max,
         }));
     }

@@ -56,11 +56,11 @@ fn directional_data(points: usize, dimensions: usize) -> Matrix<f32> {
     )
 }
 
-fn sorted_memberships(leaves: &[Leaf]) -> Vec<Vec<u32>> {
+fn sorted_memberships(leaves: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let mut memberships: Vec<Vec<u32>> = leaves
         .iter()
         .map(|leaf| {
-            let mut ids = leaf.indices.clone();
+            let mut ids = leaf.clone();
             ids.sort_unstable();
             ids
         })
@@ -69,17 +69,17 @@ fn sorted_memberships(leaves: &[Leaf]) -> Vec<Vec<u32>> {
     memberships
 }
 
-fn assert_valid_partition(leaves: &[Leaf], points: usize, c_max: usize, replicas: usize) {
+fn assert_valid_partition(leaves: &[Vec<u32>], points: usize, c_max: usize, replicas: usize) {
     assert!(leaves
         .iter()
-        .all(|leaf| !leaf.indices.is_empty() && leaf.indices.len() <= c_max));
+        .all(|leaf| !leaf.is_empty() && leaf.len() <= c_max));
     let mut counts = vec![0usize; points];
     for leaf in leaves {
-        let mut ids = leaf.indices.clone();
+        let mut ids = leaf.clone();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), leaf.indices.len(), "duplicate ID inside a leaf");
-        for &id in &leaf.indices {
+        assert_eq!(ids.len(), leaf.len(), "duplicate ID inside a leaf");
+        for &id in leaf {
             assert!((id as usize) < points);
             counts[id as usize] += 1;
         }
@@ -92,12 +92,7 @@ fn returns_one_leaf_at_and_below_c_max() {
     for points in [7, 8] {
         let data = clustered_data(points, 3);
         let leaves = partition(data.as_view(), &config(2, 8, vec![2], 1), Metric::L2).unwrap();
-        assert_eq!(
-            leaves,
-            vec![Leaf {
-                indices: (0..points as u32).collect()
-            }]
-        );
+        assert_eq!(leaves, vec![(0..points as u32).collect::<Vec<_>>()]);
     }
 }
 
@@ -111,7 +106,7 @@ fn partition_is_fixed_seed_deterministic_and_bounded() {
 
     assert_eq!(sorted_memberships(&first), sorted_memberships(&second));
     assert_valid_partition(&first, 96, 16, 2);
-    assert!(first.iter().map(|leaf| leaf.indices.len()).sum::<usize>() > 96 * 2);
+    assert!(first.iter().map(Vec::len).sum::<usize>() > 96 * 2);
 }
 
 #[test]
@@ -140,42 +135,22 @@ fn duplicate_points_return_iteration_limit_instead_of_oversized_leaf() {
 
 #[test]
 fn global_merge_canonicalizes_small_leaf_membership() {
-    let leaves = vec![
-        Leaf {
-            indices: vec![9, 3, 1],
-        },
-        Leaf {
-            indices: vec![3, 2],
-        },
-        Leaf { indices: vec![8] },
-    ];
+    let leaves = vec![vec![9, 3, 1], vec![3, 2], vec![8]];
 
     let merged = global_merge_small(leaves, 4, 8).unwrap();
 
-    assert_eq!(
-        merged,
-        vec![Leaf {
-            indices: vec![1, 2, 3, 8, 9]
-        }]
-    );
+    assert_eq!(merged, vec![vec![1, 2, 3, 8, 9]]);
 }
 
 #[test]
-fn global_merge_rejects_an_oversized_result() {
-    let leaves = vec![
-        Leaf {
-            indices: vec![0, 1, 2],
-        },
-        Leaf {
-            indices: vec![3, 4, 5],
-        },
-    ];
+fn global_merge_never_overfills_before_reaching_c_min() {
+    let leaves = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
 
-    let error = global_merge_small(leaves, 4, 5).unwrap_err();
+    let merged = global_merge_small(leaves, 11, 11).unwrap();
 
     assert_eq!(
-        error.downcast::<PartitionError>().unwrap(),
-        PartitionError::InvalidLeaf { size: 6, limit: 5 }
+        merged,
+        vec![vec![0, 1, 2, 3, 4, 5, 6, 7], vec![8, 9, 10, 11]]
     );
 }
 
