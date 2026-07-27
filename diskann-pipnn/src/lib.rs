@@ -5,12 +5,18 @@
 
 //! PiPNN graph construction.
 
+mod finalization;
 pub mod leaf;
-pub mod partition;
 mod leaf_build;
+pub mod partition;
 mod partitioning;
 
-use diskann::{graph::Config, ANNError, ANNResult};
+use diskann::{
+    graph::{AdjacencyList, Config},
+    utils::VectorRepr,
+    ANNError, ANNResult,
+};
+use diskann_utils::views::MatrixView;
 use diskann_vector::distance::Metric;
 use rayon::ThreadPool;
 
@@ -115,6 +121,61 @@ impl<'a> PiPNNBuildContext<'a> {
             pool,
         })
     }
+}
+
+/// Build PiPNN adjacency for real rows in `data`.
+///
+/// This is the core algorithm boundary. Search entry-point selection, frozen nodes,
+/// providers, serialization, and index writers belong to the outer build pipelines.
+pub fn build_graph<T>(
+    data: MatrixView<'_, T>,
+    context: &PiPNNBuildContext<'_>,
+) -> ANNResult<Vec<AdjacencyList<u32>>>
+where
+    T: VectorRepr + Send + Sync + 'static,
+{
+    context.pool.install(|| build_graph_inner(data, context))
+}
+
+fn build_graph_inner<T>(
+    data: MatrixView<'_, T>,
+    context: &PiPNNBuildContext<'_>,
+) -> ANNResult<Vec<AdjacencyList<u32>>>
+where
+    T: VectorRepr + Send + Sync + 'static,
+{
+    if data.nrows() == 0 {
+        return Err(ANNError::log_dimension_mismatch_error(
+            "PiPNN requires at least one data row".into(),
+        ));
+    }
+    if data.ncols() == 0 {
+        return Err(ANNError::log_dimension_mismatch_error(
+            "PiPNN requires at least one data dimension".into(),
+        ));
+    }
+    if data.nrows() > u32::MAX as usize {
+        return Err(config_error(format!(
+            "dataset row count ({}) exceeds the u32 graph ID limit",
+            data.nrows()
+        )));
+    }
+    data.nrows().checked_mul(data.ncols()).ok_or_else(|| {
+        ANNError::log_dimension_mismatch_error(format!(
+            "PiPNN dataset shape {} x {} overflows usize",
+            data.nrows(),
+            data.ncols()
+        ))
+    })?;
+
+    let leaves = tracing::info_span!("pipnn.partition")
+        .in_scope(|| partitioning::partition(data, &context.config, context.metric))?;
+    let candidates = tracing::info_span!("pipnn.leaf_build").in_scope(|| {
+        leaf_build::build_leaf_candidates(data, &leaves, context.config.k, context.metric)
+            .map_err(ANNError::opaque)
+    })?;
+    tracing::info_span!("pipnn.finalization")
+        .in_scope(|| finalization::prune_overfull(data, candidates, context.graph, context.metric))
 }
 
 #[track_caller]

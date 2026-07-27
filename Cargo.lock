@@ -665,10 +665,11 @@ dependencies = [
  "diskann-utils",
  "diskann-vector",
  "diskann-wide",
- "rand",
  "half",
+ "rand",
  "rayon",
  "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]

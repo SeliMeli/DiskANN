@@ -76,6 +76,14 @@ where
     pub fn neighbors(&self) -> &AdjacencyList<I> {
         &self.neighbors
     }
+
+    /// Exchange the most recent output with caller-owned adjacency storage.
+    ///
+    /// This lets parallel adapters return one row while retaining the caller's old
+    /// allocation as scratch for the next prune.
+    pub fn swap_neighbors(&mut self, neighbors: &mut AdjacencyList<I>) {
+        std::mem::swap(&mut self.neighbors, neighbors);
+    }
 }
 
 impl<I> Default for Scratch<I>
