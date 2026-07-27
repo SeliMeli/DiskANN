@@ -5,7 +5,10 @@
 
 //! Leaf construction and direct candidate accumulation.
 
-use std::{collections::TryReserveError, sync::Mutex};
+use std::{
+    collections::{HashSet, TryReserveError},
+    sync::Mutex,
+};
 
 use diskann::{graph::AdjacencyList, utils::VectorRepr};
 use diskann_utils::views::MatrixView;
@@ -31,6 +34,8 @@ pub(crate) enum LeafBuildError {
         point: u32,
         points: usize,
     },
+    #[error("point ID {point} appears more than once in leaf {leaf}")]
+    DuplicatePointId { leaf: usize, point: u32 },
     #[error("leaf {leaf} shape {rows} x {columns} overflows usize")]
     ShapeOverflow {
         leaf: usize,
@@ -76,6 +81,7 @@ struct LeafBuffers {
     nearest: Vec<LeafNeighbor>,
     local_graph: Vec<AdjacencyList<u32>>,
     top_k: LeafTopKWorkspace,
+    seen_ids: HashSet<u32>,
 }
 
 impl LeafBuffers {
@@ -179,7 +185,6 @@ pub(crate) fn build_leaf_candidates<T>(
     leaves: &[Vec<u32>],
     k: usize,
     metric: Metric,
-    pool: &rayon::ThreadPool,
 ) -> Result<Vec<AdjacencyList<u32>>, LeafBuildError>
 where
     T: VectorRepr + 'static,
@@ -192,14 +197,12 @@ where
     }
 
     let candidates = DirectCandidates::new(data.nrows())?;
-    pool.install(|| {
-        leaves.par_iter().enumerate().try_for_each_init(
-            LeafBuffers::default,
-            |buffers, (leaf, point_ids)| {
-                build_leaf(data, leaf, point_ids, k, metric, buffers, &candidates)
-            },
-        )
-    })?;
+    leaves.par_iter().enumerate().try_for_each_init(
+        LeafBuffers::default,
+        |buffers, (leaf, point_ids)| {
+            build_leaf(data, leaf, point_ids, k, metric, buffers, &candidates)
+        },
+    )?;
     candidates.into_rows()
 }
 
@@ -218,6 +221,11 @@ where
     if point_ids.is_empty() {
         return Err(LeafBuildError::EmptyLeaf { leaf });
     }
+    buffers.seen_ids.clear();
+    buffers
+        .seen_ids
+        .try_reserve(point_ids.len())
+        .map_err(|source| allocation_error("leaf ID set", point_ids.len(), source))?;
     for &point in point_ids {
         if point as usize >= data.nrows() {
             return Err(LeafBuildError::InvalidPointId {
@@ -225,6 +233,9 @@ where
                 point,
                 points: data.nrows(),
             });
+        }
+        if !buffers.seen_ids.insert(point) {
+            return Err(LeafBuildError::DuplicatePointId { leaf, point });
         }
     }
     let actual_k = buffers.prepare(leaf, point_ids.len(), data.ncols(), k)?;

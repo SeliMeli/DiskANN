@@ -6,6 +6,7 @@
 use diskann_utils::views::MatrixView;
 use diskann_vector::distance::Metric;
 use half::f16;
+use std::collections::BTreeSet;
 
 use super::{
     add_symmetric_edges, allocation_error, build_leaf_candidates, DirectCandidates, LeafBuffers,
@@ -32,11 +33,68 @@ fn build<T>(
 where
     T: diskann::utils::VectorRepr + 'static,
 {
-    build_leaf_candidates(data, leaves, k, metric, &pool())
+    pool().install(|| build_leaf_candidates(data, leaves, k, metric))
 }
 
 fn rows(graph: Vec<diskann::graph::AdjacencyList<u32>>) -> Vec<Vec<u32>> {
     graph.into_iter().map(Vec::from).collect()
+}
+
+fn brute_force_symmetric_l2(data: &[[f32; 2]], k: usize) -> Vec<Vec<u32>> {
+    let mut graph = vec![BTreeSet::new(); data.len()];
+    for (source, left) in data.iter().enumerate() {
+        let mut nearest: Vec<_> = data
+            .iter()
+            .enumerate()
+            .filter(|(target, _)| *target != source)
+            .map(|(target, right)| {
+                let distance = left
+                    .iter()
+                    .zip(right)
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum::<f32>();
+                (target, distance)
+            })
+            .collect();
+        nearest.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for &(target, _) in nearest.iter().take(k) {
+            graph[source].insert(target as u32);
+            graph[target].insert(source as u32);
+        }
+    }
+    graph
+        .into_iter()
+        .map(|neighbors| neighbors.into_iter().collect())
+        .collect()
+}
+
+#[test]
+fn leaf_adjacency_matches_an_independent_all_pairs_reference() {
+    let points = [
+        [0.0_f32, 0.0],
+        [1.0, 0.2],
+        [3.1, 0.5],
+        [7.8, 1.4],
+        [-2.3, 4.1],
+        [6.7, -3.2],
+    ];
+    let flat: Vec<_> = points.into_iter().flatten().collect();
+
+    let actual = rows(
+        build(
+            view(&flat, points.len(), 2),
+            &[(0..points.len() as u32).collect()],
+            2,
+            Metric::L2,
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(actual, brute_force_symmetric_l2(&points, 2));
 }
 
 #[test]
@@ -145,14 +203,13 @@ fn parallel_leaf_schedule_does_not_change_candidate_order() {
         .map(|offset| (0..16).map(|point| (point + offset) % 64).collect())
         .collect();
     let pool = pool();
-
-    let expected =
-        build_leaf_candidates(view(&data, 64, 1), &leaves, 2, Metric::L2, &pool).unwrap();
-    for _ in 0..8 {
-        let actual =
-            build_leaf_candidates(view(&data, 64, 1), &leaves, 2, Metric::L2, &pool).unwrap();
-        assert_eq!(actual, expected);
-    }
+    pool.install(|| {
+        let expected = build_leaf_candidates(view(&data, 64, 1), &leaves, 2, Metric::L2).unwrap();
+        for _ in 0..8 {
+            let actual = build_leaf_candidates(view(&data, 64, 1), &leaves, 2, Metric::L2).unwrap();
+            assert_eq!(actual, expected);
+        }
+    });
 }
 
 #[test]
@@ -182,6 +239,10 @@ fn rejects_invalid_shape_inputs_without_panicking() {
     assert!(matches!(
         build(view(&data, 2, 1), &[vec![0, 2]], 0, Metric::L2),
         Err(LeafBuildError::InvalidPointId { point: 2, .. })
+    ));
+    assert!(matches!(
+        build(view(&data, 2, 1), &[vec![0, 0]], 1, Metric::L2),
+        Err(LeafBuildError::DuplicatePointId { leaf: 0, point: 0 })
     ));
 }
 
