@@ -7,6 +7,7 @@
 
 pub mod leaf;
 pub mod partition;
+mod partitioning;
 
 use diskann::{graph::Config, ANNError, ANNResult};
 use diskann_vector::distance::Metric;
