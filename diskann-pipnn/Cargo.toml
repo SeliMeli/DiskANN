@@ -15,5 +15,13 @@ diskann-vector.workspace = true
 diskann-wide.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+diskann-linalg.workspace = true
+
+[[bench]]
+name = "kernels"
+harness = false
+
 [lints]
 workspace = true
