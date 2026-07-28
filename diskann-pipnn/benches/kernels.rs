@@ -8,8 +8,8 @@ use std::{hint::black_box, time::Duration};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use diskann_linalg::{sgemm, sgemm_aat_lower, Transpose};
 use diskann_pipnn::{
-    leaf::{nearest_leaf_neighbors, LeafNeighbor, LeafTopK, LeafTopKWorkspace},
-    partition::{nearest_leaders, PartitionTopK},
+    leaf_kernel::{nearest_leaf_neighbors, LeafNeighbor, LeafTopK, LeafTopKWorkspace},
+    partition_kernel::{nearest_leaders, PartitionTopK},
 };
 use diskann_vector::distance::Metric;
 

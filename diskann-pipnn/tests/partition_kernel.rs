@@ -3,10 +3,130 @@
  * Licensed under the MIT license.
  */
 
-use diskann_pipnn::partition::{
+use diskann_pipnn::partition_kernel::{
     nearest_leaders, PartitionKernelError, PartitionTopK, MAX_PARTITION_FANOUT,
 };
 use diskann_vector::distance::Metric;
+
+fn reference(input: PartitionTopK<'_>, fanout: usize) -> Vec<u32> {
+    let mut output = vec![u32::MAX; input.rows * fanout];
+    for (row_index, (dots, output)) in input
+        .dots
+        .chunks_exact(input.leaders)
+        .zip(output.chunks_exact_mut(fanout))
+        .enumerate()
+    {
+        let row_scale = input.row_scales.get(row_index).copied().unwrap_or(0.0);
+        let mut candidates: Vec<_> = dots
+            .iter()
+            .enumerate()
+            .filter_map(|(leader, &dot)| {
+                let leader_scale = input.leader_scales.get(leader).copied().unwrap_or(0.0);
+                let distance = match input.metric {
+                    Metric::L2 => leader_scale - 2.0 * dot,
+                    Metric::CosineNormalized => 1.0 - dot,
+                    Metric::InnerProduct => -dot,
+                    Metric::Cosine => {
+                        let denominator = row_scale.sqrt() * leader_scale;
+                        1.0 - if denominator > 0.0 {
+                            dot / denominator
+                        } else {
+                            0.0
+                        }
+                    }
+                };
+                (distance.partial_cmp(&f32::MAX) == Some(std::cmp::Ordering::Less))
+                    .then_some((leader as u32, distance))
+            })
+            .collect();
+        candidates.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap());
+        for (destination, (leader, _)) in output.iter_mut().zip(candidates) {
+            *destination = leader;
+        }
+    }
+    output
+}
+
+fn differential_input(metric: Metric, leaders: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let dots = (0..2 * leaders)
+        .map(|index| {
+            let leader = index % leaders;
+            let row = index / leaders;
+            let base = ((leader * 13 + row * 7) % 19) as f32 - 9.0;
+            if leader == 2 || leader == 3 {
+                1.0
+            } else if leader + 1 == leaders {
+                f32::NAN
+            } else {
+                base * 0.25
+            }
+        })
+        .collect();
+    let row_scales = if metric == Metric::Cosine {
+        vec![0.0, 16.0]
+    } else {
+        Vec::new()
+    };
+    let leader_scales = match metric {
+        Metric::Cosine => (0..leaders)
+            .map(|leader| {
+                if leader == 1 {
+                    0.0
+                } else if leader == 2 || leader == 3 {
+                    3.0
+                } else {
+                    1.0 + leader as f32
+                }
+            })
+            .collect(),
+        Metric::L2 => (0..leaders)
+            .map(|leader| {
+                let norm = if leader == 2 || leader == 3 {
+                    3.0
+                } else {
+                    leader as f32 + 1.0
+                };
+                norm * norm
+            })
+            .collect(),
+        Metric::CosineNormalized | Metric::InnerProduct => Vec::new(),
+    };
+    (dots, row_scales, leader_scales)
+}
+
+#[test]
+fn dispatch_matches_reference_across_simd_width_boundaries() {
+    for metric in [
+        Metric::L2,
+        Metric::Cosine,
+        Metric::CosineNormalized,
+        Metric::InnerProduct,
+    ] {
+        for leaders in [7, 8, 9, 15, 16, 17] {
+            let (dots, row_scales, leader_scales) = differential_input(metric, leaders);
+            for fanout in [1, 2, 16] {
+                if fanout >= leaders {
+                    continue;
+                }
+                let input = PartitionTopK {
+                    dots: &dots,
+                    rows: 2,
+                    leaders,
+                    row_scales: &row_scales,
+                    leader_scales: &leader_scales,
+                    metric,
+                };
+                let expected = reference(input, fanout);
+                let mut actual = vec![u32::MAX; expected.len()];
+                nearest_leaders(input, fanout, &mut actual).unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "{metric:?}, leaders={leaders}, k={fanout}"
+                );
+            }
+        }
+    }
+}
 
 #[test]
 fn l2_keeps_the_first_leader_when_boundary_distances_tie() {

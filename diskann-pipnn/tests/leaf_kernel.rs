@@ -3,10 +3,131 @@
  * Licensed under the MIT license.
  */
 
-use diskann_pipnn::leaf::{
+use diskann_pipnn::leaf_kernel::{
     nearest_leaf_neighbors, LeafKernelError, LeafNeighbor, LeafTopK, LeafTopKWorkspace,
 };
 use diskann_vector::distance::Metric;
+use std::cmp::Ordering;
+
+fn differential_input(metric: Metric, points: usize) -> Vec<f32> {
+    let mut dots = vec![f32::NAN; points * points];
+    for row in 0..points {
+        dots[row * points + row] = if metric == Metric::Cosine && row == 0 {
+            0.0
+        } else if row == 2 {
+            2.0
+        } else {
+            1.0 + (row % 5) as f32
+        };
+        for column in 0..row {
+            let pair = ((row * 17 + column * 11) % 23) as f32 - 11.0;
+            dots[row * points + column] = if row == points - 1 && column == 0 {
+                f32::NAN
+            } else if column == 1 || column == 2 {
+                0.5
+            } else {
+                pair * 0.03125
+            };
+        }
+    }
+    dots
+}
+
+fn reference(input: LeafTopK<'_>, requested_k: usize) -> Vec<LeafNeighbor> {
+    let k = requested_k.min(input.points.saturating_sub(1));
+    let mut output = vec![LeafNeighbor::default(); input.points * k];
+    if k == 0 {
+        return output;
+    }
+
+    let norms: Vec<_> = (0..input.points)
+        .map(|row| {
+            let diagonal = input.dots[row * input.points + row];
+            if input.metric == Metric::Cosine {
+                if diagonal < f32::MIN_POSITIVE {
+                    0.0
+                } else {
+                    diagonal.sqrt()
+                }
+            } else {
+                diagonal
+            }
+        })
+        .collect();
+
+    for row in 0..input.points {
+        let mut candidates = Vec::with_capacity(input.points - 1);
+        for position in 0..input.points {
+            if position == row {
+                continue;
+            }
+            let (lower_row, lower_column) = if row > position {
+                (row, position)
+            } else {
+                (position, row)
+            };
+            let dot = input.dots[lower_row * input.points + lower_column];
+            let clamp = |distance: f32| {
+                if distance < 0.0 {
+                    0.0
+                } else {
+                    distance
+                }
+            };
+            let distance = match input.metric {
+                Metric::L2 => clamp(norms[row] + norms[position] - 2.0 * dot),
+                Metric::CosineNormalized => clamp(1.0 - dot),
+                Metric::InnerProduct => -dot,
+                Metric::Cosine => {
+                    let denominator = norms[row] * norms[position];
+                    let similarity = if denominator == 0.0 {
+                        0.0
+                    } else {
+                        dot / denominator
+                    };
+                    clamp(1.0 - similarity)
+                }
+            };
+            if distance.partial_cmp(&f32::MAX) == Some(Ordering::Less) {
+                candidates.push(LeafNeighbor::new(position as u32, distance));
+            }
+        }
+        candidates.sort_by(|left, right| {
+            left.distance
+                .partial_cmp(&right.distance)
+                .expect("NaN distances were filtered")
+        });
+        let count = candidates.len().min(k);
+        output[row * k..row * k + count].copy_from_slice(&candidates[..count]);
+    }
+    output
+}
+
+#[test]
+fn dispatch_matches_reference_across_simd_width_boundaries() {
+    for metric in [
+        Metric::L2,
+        Metric::Cosine,
+        Metric::CosineNormalized,
+        Metric::InnerProduct,
+    ] {
+        for points in [7, 8, 9, 15, 16, 17, 64, 256, 512] {
+            let dots = differential_input(metric, points);
+            let input = LeafTopK {
+                dots: &dots,
+                points,
+                metric,
+            };
+            for requested_k in [1, 2, 4] {
+                let expected = reference(input, requested_k);
+                let mut actual = vec![LeafNeighbor::default(); expected.len()];
+                let mut workspace = LeafTopKWorkspace::new();
+                nearest_leaf_neighbors(input, requested_k, &mut actual, &mut workspace).unwrap();
+                assert_eq!(actual, expected, "{metric:?}, n={points}, k={requested_k}");
+            }
+        }
+    }
+}
 
 fn run(dots: &[f32], points: usize, k: usize, metric: Metric) -> (usize, Vec<LeafNeighbor>) {
     let actual_k = k.min(points.saturating_sub(1));
